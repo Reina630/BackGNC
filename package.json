@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "docx-preview": "^0.3.7",
+    "xlsx": "^0.18.5"
+  }
+}

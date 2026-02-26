@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Django
+*.sqlite3
+db.sqlite3
+
+# Environnements virtuels
+venv/
+# ENV/
+# .env/
+
+# Fichiers de configuration secrets
+# .env
+
+# VS Code
+.vscode/
+
+# Migrations
+# folders/migrations/
+# */migrations/*.py
+# */migrations/*.pyc
+
+# Media
+media/
+
+# Autres
+*.log
+*.pot
+*.pyc
+*.swp
+*.swo
+
+# Mac
+.DS_Store
+
+# Windows
+Thumbs.db
