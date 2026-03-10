@@ -25,7 +25,7 @@ venv/
 # */migrations/*.pyc
 
 # Media
-media/
+#media/
 
 # Autres
 *.log
