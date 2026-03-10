@@ -1,17 +1,29 @@
 from rest_framework import serializers
-from .models import User
+from .models import User, Service, Notification
 
 
 class UserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=False, style={'input_type': 'password'})
+    service_nom = serializers.CharField(source='service.nom', read_only=True)
+    signature_url = serializers.SerializerMethodField()
     
     class Meta:
         model = User
-        fields = ['id', 'username', 'email', 'role', 'password', 'is_active', 'date_joined']
+        fields = ['id', 'username', 'email', 'role', 'password', 'is_active', 'date_joined', 
+                  'service', 'service_nom', 'signature_electronique', 'signature_url']
         read_only_fields = ['id', 'date_joined']
         extra_kwargs = {
             'email': {'required': True},
         }
+    
+    def get_signature_url(self, obj):
+        """Retourne l'URL complète de la signature électronique"""
+        if obj.signature_electronique:
+            request = self.context.get('request')
+            if request is not None:
+                return request.build_absolute_uri(obj.signature_electronique.url)
+            return obj.signature_electronique.url
+        return None
     
     def create(self, validated_data):
         """
@@ -44,3 +56,26 @@ class UserSerializer(serializers.ModelSerializer):
         
         instance.save()
         return instance
+
+
+class ServiceSerializer(serializers.ModelSerializer):
+    """Serializer pour les services"""
+    utilisateurs = UserSerializer(many=True, read_only=True)
+    nombre_utilisateurs = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = Service
+        fields = ['id', 'nom', 'description', 'utilisateurs', 'nombre_utilisateurs', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at']
+    
+    def get_nombre_utilisateurs(self, obj):
+        return obj.utilisateurs.count()
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    """Serializer pour les notifications"""
+    
+    class Meta:
+        model = Notification
+        fields = ['id', 'type', 'titre', 'message', 'lue', 'courrier_id', 'document_id', 'created_at', 'lue_at']
+        read_only_fields = ['id', 'created_at', 'lue_at']

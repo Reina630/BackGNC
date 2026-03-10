@@ -27,7 +27,7 @@ urlpatterns = [
     path('api/', include('documents.urls')),
     path('api/', include('tags.urls')),
     path('api/scan/', include('scan.urls')),
-    path('api/', include('courriers.urls')),
+    # path('api/', include('courriers.urls')),
 ]
 # On ajoute le service des fichiers média seulement en mode DEBUG (développement)
 if settings.DEBUG:

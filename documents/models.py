@@ -46,11 +46,29 @@ class Document(models.Model):
     file_type = models.CharField(max_length=20, choices=FILE_TYPE_CHOICES)
     visibility = models.CharField(max_length=20, choices=VISIBILITY_CHOICES, default='private')
     is_favorite = models.BooleanField(default=False)
+    is_deleted = models.BooleanField(default=False, help_text='Document archivé/supprimé')
+    deleted_at = models.DateTimeField(null=True, blank=True, help_text='Date de suppression/archivage')
+    deleted_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='deleted_documents', help_text='Utilisateur qui a supprimé le document')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
         return self.title
+    
+    def soft_delete(self, user):
+        """Archiver (supprimer doucement) le document"""
+        from django.utils import timezone
+        self.is_deleted = True
+        self.deleted_at = timezone.now()
+        self.deleted_by = user
+        self.save()
+    
+    def restore(self):
+        """Restaurer le document depuis les archives"""
+        self.is_deleted = False
+        self.deleted_at = None
+        self.deleted_by = None
+        self.save()
 
 
 class DocumentVersion(models.Model):
@@ -131,6 +149,7 @@ class Courrier(models.Model):
     TYPE_CHOICES = [
         ('entrant', 'Courrier Entrant'),
         ('sortant', 'Courrier Sortant'),
+        ('interne', 'Courrier Interne'),
     ]
     
     # Choix pour le statut de traitement
@@ -308,6 +327,11 @@ class Courrier(models.Model):
         help_text="Date et heure de dernière modification"
     )
     
+    # ===== ARCHIVAGE (SOFT DELETE) =====
+    is_deleted = models.BooleanField(default=False, help_text='Courrier archivé/supprimé')
+    deleted_at = models.DateTimeField(null=True, blank=True, help_text='Date de suppression')
+    deleted_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='deleted_courriers', help_text='Utilisateur qui a supprimé le courrier')
+    
     class Meta:
         ordering = ['-created_at']  # Tri par date décroissante (plus récent en premier)
         verbose_name = "Courrier"
@@ -426,6 +450,58 @@ class Courrier(models.Model):
         )
         
         return nouvelle_version
+    
+    def soft_delete(self, user):
+        """Archiver le courrier (soft delete)"""
+        from django.utils import timezone
+        self.is_deleted = True
+        self.deleted_at = timezone.now()
+        self.deleted_by = user
+        self.save()
+    
+    def restore(self):
+        """Restaurer un courrier archivé"""
+        self.is_deleted = False
+        self.deleted_at = None
+        self.deleted_by = None
+        self.save()
+    
+    @staticmethod
+    def get_service_code_from_name(service_name: str) -> str:
+        """
+        Mapper le nom d'un service vers son code correspondant
+        @param service_name: Nom du service (ex: "Ressources Humaines", "Direction Générale")
+        @return: Code du service (ex: "rh", "direction")
+        """
+        # Mapping exact des services
+        service_mapping = {
+            'Ressources Humaines': 'rh',
+            'RH': 'rh',
+            'Comptabilité': 'comptabilite', 
+            'Direction': 'direction',
+            'Direction Générale': 'direction',
+            'DG': 'direction',
+            'Service Technique': 'technique',
+            'Technique': 'technique',
+            'Commercial': 'commercial',
+            'Juridique': 'juridique',
+            'Informatique': 'informatique',
+            'IT': 'informatique',
+            'Logistique': 'logistique',
+        }
+        
+        # Essayer correspondance exacte
+        if service_name in service_mapping:
+            return service_mapping[service_name]
+        
+        # Essayer correspondance partielle (insensible à la casse)
+        service_name_lower = service_name.lower()
+        for key, value in service_mapping.items():
+            if key.lower() in service_name_lower or service_name_lower in key.lower():
+                return value
+        
+        # Par défaut, retourner 'autre'
+        return 'autre'
 
 
 class PartageLog(models.Model):
@@ -492,3 +568,122 @@ class PartageLog(models.Model):
     
     def __str__(self):
         return f"Partage {self.type_partage} - {self.courrier.numero_registre} vers {self.destinataire}"
+
+
+# ============================================================================
+# MODÈLE POUR L'AFFECTATION DES COURRIERS AUX UTILISATEURS
+# ============================================================================
+
+class AffectationCourrier(models.Model):
+    """
+    Modèle pour gérer l'affectation des courriers aux utilisateurs via la plateforme
+    """
+    STATUT_CHOICES = [
+        ('en_attente', 'En attente'),
+        ('lu', 'Lu'),
+        ('en_traitement', 'En traitement'),
+        ('valide', 'Validé'),
+        ('rejete', 'Rejeté'),
+        ('signe', 'Signé'),
+    ]
+    
+    # Relations
+    courrier = models.ForeignKey(Courrier, on_delete=models.CASCADE, related_name='affectations')
+    utilisateur = models.ForeignKey(User, on_delete=models.CASCADE, related_name='courriers_affectes')
+    affecte_par = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='affectations_creees')
+    
+    # Informations
+    note = models.TextField(blank=True, help_text="Note de l'affecteur")
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default='en_attente')
+    commentaire_traitement = models.TextField(blank=True, help_text="Commentaire de l'utilisateur lors du traitement")
+    motif_rejet = models.TextField(blank=True, help_text="Motif en cas de rejet")
+    
+    # Métadonnées
+    date_affectation = models.DateTimeField(auto_now_add=True)
+    date_lecture = models.DateTimeField(null=True, blank=True, help_text="Date de première lecture")
+    date_traitement = models.DateTimeField(null=True, blank=True, help_text="Date de validation/rejet/signature")
+    
+    class Meta:
+        ordering = ['-date_affectation']
+        verbose_name = 'Affectation de courrier'
+        verbose_name_plural = 'Affectations de courriers'
+        indexes = [
+            models.Index(fields=['utilisateur', 'statut']),
+            models.Index(fields=['-date_affectation']),
+        ]
+        # Pas de contrainte d'unicité car un même courrier peut être affecté à plusieurs utilisateurs
+    
+    def __str__(self):
+        return f"{self.courrier.numero_registre} → {self.utilisateur.username} ({self.get_statut_display()})"
+    
+    def marquer_comme_lu(self):
+        """Marque l'affectation comme lue"""
+        if not self.date_lecture:
+            from django.utils import timezone
+            self.date_lecture = timezone.now()
+            if self.statut == 'en_attente':
+                self.statut = 'lu'
+            self.save()
+    
+    def valider(self, commentaire=''):
+        """Valide le courrier"""
+        from django.utils import timezone
+        self.statut = 'valide'
+        self.commentaire_traitement = commentaire
+        self.date_traitement = timezone.now()
+        self.save()
+        # Mettre à jour le statut du courrier vers "traité"
+        self._update_courrier_statut()
+    
+    def rejeter(self, motif=''):
+        """Rejette le courrier"""
+        from django.utils import timezone
+        self.statut = 'rejete'
+        self.motif_rejet = motif
+        self.date_traitement = timezone.now()
+        self.save()
+        # Mettre à jour le statut du courrier vers "traité"
+        self._update_courrier_statut()
+    
+    def signer(self, commentaire=''):
+        """Signe le courrier électroniquement"""
+        from django.utils import timezone
+        self.statut = 'signe'
+        self.commentaire_traitement = commentaire
+        self.date_traitement = timezone.now()
+        self.save()
+        # Mettre à jour le statut du courrier vers "traité"
+        self._update_courrier_statut()
+    
+    def _update_courrier_statut(self):
+        """
+        Met à jour le statut du courrier associé à cette affectation.
+        Si toutes les affectations ont été traitées (validé/rejeté/signé), 
+        le courrier passe à "traité".
+        """
+        # Vérifier si toutes les affectations du courrier sont traitées
+        affectations = self.courrier.affectations.all()
+        statuts_traites = ['valide', 'rejete', 'signe']
+        
+        # Si toutes les affectations sont dans un statut "traité"
+        if all(aff.statut in statuts_traites for aff in affectations):
+            self.courrier.statut = 'traite'
+            self.courrier.save()
+
+
+class CommentaireCourrier(models.Model):
+    """
+    Modèle pour les commentaires sur les affectations de courriers
+    """
+    affectation = models.ForeignKey(AffectationCourrier, on_delete=models.CASCADE, related_name='commentaires')
+    auteur = models.ForeignKey(User, on_delete=models.CASCADE)
+    contenu = models.TextField()
+    date_creation = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['-date_creation']
+        verbose_name = 'Commentaire'
+        verbose_name_plural = 'Commentaires'
+    
+    def __str__(self):
+        return f"Commentaire de {self.auteur.username} sur {self.affectation.courrier.numero_registre}"

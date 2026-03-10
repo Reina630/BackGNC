@@ -1,11 +1,21 @@
 import mimetypes
 import json
+import io
+import os
+from datetime import datetime
 
 from django.core.files.base import ContentFile
 from django.db.models import Q
 from django.http import FileResponse
 from django_filters.rest_framework import DjangoFilterBackend
 from django_filters import rest_framework as filters
+
+# Imports pour la signature PDF
+from PyPDF2 import PdfReader, PdfWriter
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.utils import ImageReader
+from PIL import Image
 # Create your views here.
 from rest_framework import viewsets, status
 from rest_framework import filters as rest_filters
@@ -15,7 +25,10 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from .filters import DocumentFilter
-from .models import Document, DocumentVersion, DocumentShare, ShareRequest, Courrier, PartageLog, Categorie
+from .models import (
+    Document, DocumentVersion, DocumentShare, ShareRequest, 
+    Courrier, PartageLog, Categorie, AffectationCourrier, CommentaireCourrier
+)
 from .serializer import (
     DocumentSerializer, 
     DocumentShareSerializer, 
@@ -26,9 +39,12 @@ from .serializer import (
     CourrierUpdateSerializer,
     PartageLogSerializer,
     PartageLogCreateSerializer,
-    CategorieSerializer
+    CategorieSerializer,
+    AffectationCourrierSerializer,
+    CommentaireCourrierSerializer,
+    ServiceSimpleSerializer
 )
-from users.models import User
+from users.models import User, Service
 from users.permissions import IsRHOrAdmin
 
 
@@ -112,10 +128,11 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """
-        Retourne tous les documents.
+        Retourne tous les documents non supprimés.
         Le champ 'has_access' dans le serializer indique si l'utilisateur y a accès.
         """
-        return Document.objects.all()
+        # Par défaut, on n'affiche que les documents non supprimés
+        return Document.objects.filter(is_deleted=False)
 
 
     @action(detail=True, methods=['get'])
@@ -415,6 +432,176 @@ class DocumentViewSet(viewsets.ModelViewSet):
             "document": DocumentSerializer(document, context={'request': request}).data
         })
 
+    def destroy(self, request, *args, **kwargs):
+        """
+        Archiver (soft delete) un document au lieu de le supprimer complètement.
+        URL : DELETE /api/documents/{id}/
+        """
+        document = self.get_object()
+        
+        # Vérifier que l'utilisateur est le propriétaire ou un admin
+        if document.owner != request.user and request.user.role != 'admin':
+            return Response(
+                {"error": "Seul le propriétaire ou un administrateur peut archiver ce document"},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Archiver le document (soft delete)
+        document.soft_delete(request.user)
+        
+        return Response({
+            "message": "Document archivé avec succès"
+        }, status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=False, methods=['get'])
+    def archives(self, request):
+        """
+        Récupérer tous les documents archivés (supprimés) accessibles par l'utilisateur.
+        URL : GET /api/documents/archives/
+        """
+        # Récupérer tous les documents supprimés
+        user = request.user
+        
+        if user.role == 'admin':
+            # Les admins voient tous les documents archivés
+            archived_docs = Document.objects.filter(is_deleted=True)
+        else:
+            # Les utilisateurs ne voient que leurs propres documents archivés
+            archived_docs = Document.objects.filter(is_deleted=True, owner=user)
+        
+        # Appliquer les filtres de recherche si nécessaire
+        search_query = request.query_params.get('search', None)
+        if search_query:
+            archived_docs = archived_docs.filter(title__icontains=search_query)
+        
+        # Trier par date de suppression (plus récent en premier)
+        archived_docs = archived_docs.order_by('-deleted_at')
+        
+        serializer = self.get_serializer(archived_docs, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def restore(self, request, pk=None):
+        """
+        Restaurer un document archivé.
+        URL : POST /api/documents/{id}/restore/
+        """
+        # Récupérer le document même s'il est supprimé
+        try:
+            document = Document.objects.get(pk=pk)
+        except Document.DoesNotExist:
+            return Response(
+                {"error": "Document non trouvé"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Vérifier que le document est bien archivé
+        if not document.is_deleted:
+            return Response(
+                {"error": "Ce document n'est pas archivé"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Vérifier que l'utilisateur est le propriétaire ou un admin
+        if document.owner != request.user and request.user.role != 'admin':
+            return Response(
+                {"error": "Seul le propriétaire ou un administrateur peut restaurer ce document"},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Restaurer le document
+        document.restore()
+        
+        serializer = self.get_serializer(document)
+        return Response({
+            "message": "Document restauré avec succès",
+            "document": serializer.data
+        })
+
+    @action(detail=True, methods=['get'])
+    def versions(self, request, pk=None):
+        """
+        Récupérer toutes les versions d'un document.
+        URL : GET /api/documents/{id}/versions/
+        """
+        document = self.get_object()
+        versions = document.versions.all().order_by('-version_number')
+        
+        # Créer une réponse simple avec les infos des versions
+        versions_data = []
+        for version in versions:
+            versions_data.append({
+                'id': version.id,
+                'version_number': version.version_number,
+                'created_at': version.created_at,
+                'updated_by': version.updated_by.get_full_name() if version.updated_by else 'Inconnu',
+                'file_url': request.build_absolute_uri(version.file.url) if version.file else None,
+                'file_name': version.file.name.split('/')[-1] if version.file else None,
+            })
+        
+        return Response(versions_data)
+
+    @action(detail=True, methods=['post'])
+    def restore_version(self, request, pk=None):
+        """
+        Restaurer une version spécifique d'un document.
+        URL : POST /api/documents/{id}/restore_version/
+        Body: {"version_id": 123}
+        """
+        document = self.get_object()
+        
+        # Vérifier que l'utilisateur est le propriétaire ou un admin
+        if document.owner != request.user and request.user.role != 'admin':
+            return Response(
+                {"error": "Seul le propriétaire ou un administrateur peut restaurer une version"},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        version_id = request.data.get('version_id')
+        if not version_id:
+            return Response(
+                {"error": "version_id requis"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            version = DocumentVersion.objects.get(id=version_id, document=document)
+        except DocumentVersion.DoesNotExist:
+            return Response(
+                {"error": "Version non trouvée"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Créer une nouvelle version avec le fichier de la version restaurée
+        max_version = document.versions.aggregate(models.Max('version_number'))['version_number__max'] or 0
+        new_version_number = max_version + 1
+        
+        # Sauvegarder l'ancien fichier avant de le remplacer
+        old_file = document.file
+        
+        # Copier le fichier de la version à restaurer
+        from django.core.files.base import ContentFile
+        document.file.save(
+            version.file.name.split('/')[-1],
+            ContentFile(version.file.read()),
+            save=False
+        )
+        document.save()
+        
+        # Créer une nouvelle version avec le nouveau fichier
+        DocumentVersion.objects.create(
+            document=document,
+            file=document.file,
+            version_number=new_version_number,
+            updated_by=request.user
+        )
+        
+        serializer = self.get_serializer(document)
+        return Response({
+            "message": f"Version {version.version_number} restaurée comme version {new_version_number}",
+            "document": serializer.data
+        })
+
 
 class DocumentShareViewSet(viewsets.ModelViewSet):
     """ViewSet pour gérer les partages de documents"""
@@ -625,8 +812,26 @@ class CourrierFilter(filters.FilterSet):
     date_debut = filters.DateFilter(field_name="date_reception", lookup_expr='gte')
     date_fin = filters.DateFilter(field_name="date_reception", lookup_expr='lte')
     
+    # Filtre par service (accepte l'ID du service depuis la table Service)
+    service = filters.NumberFilter(method='filter_by_service')
+    
     # Recherche globale (sur plusieurs champs)
     search = filters.CharFilter(method='filter_search')
+    
+    def filter_by_service(self, queryset, name, value):
+        """
+        Filtrer par service en utilisant l'ID du service depuis la table Service.
+        Convertit l'ID en code pour filtrer sur le champ service_concerne.
+        """
+        try:
+            service = Service.objects.get(id=value)
+            # Mapper le nom du service vers son code
+            service_code = Courrier.get_service_code_from_name(service.nom)
+            if service_code:
+                return queryset.filter(service_concerne=service_code)
+            return queryset
+        except Service.DoesNotExist:
+            return queryset.none()
     
     def filter_search(self, queryset, name, value):
         """
@@ -647,6 +852,7 @@ class CourrierFilter(filters.FilterSet):
             'type_courrier': ['exact'],
             'service_concerne': ['exact'],
             'statut': ['exact'],
+            'urgent': ['exact'],
         }
 
 
@@ -655,22 +861,38 @@ class CourrierViewSet(viewsets.ModelViewSet):
     ViewSet complet pour gérer le registre de courrier RH.
     
     Fonctionnalités :
-    - CRUD complet des courriers
-    - Filtrage et recherche avancée
-    - Export Excel du registre
-    - Statistiques
-    - Changement de statut
+    - CRUD complet des courriers (RH/Admin seulement)
+    - Filtrage et recherche avancée (RH/Admin seulement)
+    - Export Excel du registre (RH/Admin seulement)
+    - Statistiques (RH/Admin seulement)
+    - Mes affectations (Tous les utilisateurs authentifiés)
+    - Services disponibles (Tous les utilisateurs authentifiés)
+    - Affectation par service (RH/Admin seulement)
     
-    Permissions : Accessible uniquement par les utilisateurs RH et Admin
+    Permissions variables selon l'action
     """
     queryset = Courrier.objects.all()
     serializer_class = CourrierSerializer
-    permission_classes = [IsAuthenticated, IsRHOrAdmin]
     parser_classes = (MultiPartParser, FormParser, JSONParser)
     filterset_class = CourrierFilter
     search_fields = ['numero_registre', 'objet', 'expediteur', 'destinataire', 'reference']
     ordering_fields = ['created_at', 'date_reception', 'date_envoi', 'numero_registre', 'statut']
     ordering = ['-created_at']  # Par défaut, les plus récents en premier
+    
+    def get_permissions(self):
+        """
+        Permissions variables selon l'action :
+        - Actions accessibles à tous les utilisateurs authentifiés : mes_affectations, services_disponibles, mes_courriers
+        - Autres actions : RH et Admin seulement
+        """
+        if self.action in ['mes_affectations', 'services_disponibles', 'mes_courriers']:
+            # Actions accessibles aux utilisateurs normaux
+            permission_classes = [IsAuthenticated]
+        else:
+            # Actions réservées aux RH et Admin
+            permission_classes = [IsAuthenticated, IsRHOrAdmin]
+        
+        return [permission() for permission in permission_classes]
     
     def get_serializer_class(self):
         """
@@ -685,6 +907,18 @@ class CourrierViewSet(viewsets.ModelViewSet):
             return CourrierUpdateSerializer
         return CourrierSerializer
     
+    def get_queryset(self):
+        """
+        Retourne les courriers en filtrant les courriers supprimés par défaut.
+        L'action 'archives' et 'restore' peuvent accéder aux courriers supprimés.
+        """
+        # Pour l'action archives et restore, on veut les courriers supprimés
+        if self.action in ['archives', 'restore']:
+            return Courrier.objects.filter(is_deleted=True)
+        
+        # Par défaut, on ne montre que les courriers non supprimés
+        return Courrier.objects.filter(is_deleted=False)
+    
     def perform_create(self, serializer):
         """
         Enregistrer le courrier et assigner automatiquement l'utilisateur connecté.
@@ -696,6 +930,27 @@ class CourrierViewSet(viewsets.ModelViewSet):
         if courrier.fichier:
             courrier.file_size = courrier.fichier.size
             courrier.save()
+    
+    def destroy(self, request, *args, **kwargs):
+        """
+        Archiver (soft delete) un courrier au lieu de le supprimer complètement.
+        URL : DELETE /api/courriers/{id}/
+        """
+        courrier = self.get_object()
+        
+        # Vérifier que l'utilisateur est le créateur ou un admin/RH
+        if courrier.enregistre_par != request.user and request.user.role not in ['admin', 'rh']:
+            return Response(
+                {"error": "Seul le créateur ou un administrateur peut archiver ce courrier"},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Archiver le courrier (soft delete)
+        courrier.soft_delete()
+        
+        return Response({
+            "message": "Courrier archivé avec succès"
+        }, status=status.HTTP_204_NO_CONTENT)
     
     @action(detail=False, methods=['post'])
     def upload(self, request):
@@ -989,6 +1244,7 @@ class CourrierViewSet(viewsets.ModelViewSet):
         Body : {"statut": "traite"} (ou "recu", "en_traitement", "archive")
         """
         courrier = self.get_object()
+        ancien_statut = courrier.statut
         nouveau_statut = request.data.get('statut')
         
         # Vérifier que le statut est valide
@@ -1005,6 +1261,25 @@ class CourrierViewSet(viewsets.ModelViewSet):
         # Mettre à jour le statut
         courrier.statut = nouveau_statut
         courrier.save()
+        
+        # Si le statut passe à "traité", notifier les personnes concernées
+        if nouveau_statut == 'traite' and ancien_statut != 'traite':
+            from users.utils import creer_notification
+            
+            # Récupérer tous ceux qui ont affecté ce courrier
+            affecteurs = courrier.affectations.filter(affecte_par__isnull=False).values_list('affecte_par', flat=True).distinct()
+            
+            for affecteur_id in affecteurs:
+                try:
+                    creer_notification(
+                        utilisateur=affecteur_id,
+                        type_notif='courrier_affecte',
+                        titre=f'Courrier traité: {courrier.numero_registre}',
+                        message=f'Le courrier "{courrier.objet}" a été marqué comme traité par {request.user.get_full_name() or request.user.username}.',
+                        courrier_id=courrier.id,
+                    )
+                except Exception as e:
+                    print(f"Erreur lors de la création de notification: {e}")
         
         return Response({
             "message": f"Statut mis à jour : {courrier.get_statut_display()}",
@@ -1134,6 +1409,299 @@ class CourrierViewSet(viewsets.ModelViewSet):
             "version_actuelle": courrier.get_version_actuelle().version_number if courrier.get_version_actuelle() else None,
             "versions": serializer.data
         })
+    
+    @action(detail=True, methods=['post'])
+    def affecter_service(self, request, pk=None):
+        """
+        Affecter un courrier à tous les utilisateurs d'un service.
+        URL : POST /api/courriers/{id}/affecter_service/
+        
+        Body JSON :
+        {
+            "service_id": 1,
+            "note": "Traitement urgent requis"
+        }
+        """
+        try:
+            courrier = self.get_object()
+            service_id = request.data.get('service_id')
+            note = request.data.get('note', '')
+            
+            if not service_id:
+                return Response(
+                    {'error': 'service_id est requis'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            try:
+                service = Service.objects.get(id=service_id)
+            except Service.DoesNotExist:
+                return Response(
+                    {'error': 'Service introuvable'}, 
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            # Récupérer tous les utilisateurs du service
+            utilisateurs_service = User.objects.filter(service=service)
+            
+            if not utilisateurs_service.exists():
+                return Response(
+                    {'error': 'Aucun utilisateur trouvé dans ce service'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Créer les affectations pour tous les utilisateurs du service
+            affectations_creees = []
+            affectations_existantes = 0
+            
+            for utilisateur in utilisateurs_service:
+                # Vérifier si l'affectation n'existe pas déjà
+                if not AffectationCourrier.objects.filter(
+                    courrier=courrier, 
+                    utilisateur=utilisateur
+                ).exists():
+                    affectation = AffectationCourrier.objects.create(
+                        courrier=courrier,
+                        utilisateur=utilisateur,
+                        affecte_par=request.user,
+                        note=note
+                    )
+                    affectations_creees.append(affectation)
+                    
+                    # Créer une notification pour cet utilisateur
+                    from users.utils import creer_notification
+                    creer_notification(
+                        utilisateur=utilisateur,
+                        type_notif='courrier_affecte',
+                        titre=f'Nouveau courrier affecté: {courrier.numero_registre}',
+                        message=f'Le courrier "{courrier.objet}" vous a été affecté pour traitement.',
+                        courrier_id=courrier.id,
+                    )
+                else:
+                    affectations_existantes += 1
+            
+            # Mettre à jour le courrier (statut et service concerné)
+            if courrier.statut == 'recu':
+                courrier.statut = 'en_traitement'
+            
+            # Mettre à jour le service concerné en utilisant la méthode du modèle
+            service_code = Courrier.get_service_code_from_name(service.nom)
+            courrier.service_concerne = service_code
+            courrier.save()
+            
+            return Response({
+                'message': f'Courrier affecté à {len(affectations_creees)} utilisateur(s) du service {service.nom}',
+                'service_nom': service.nom,
+                'service_code': service_code,
+                'utilisateurs_affectes': len(affectations_creees),
+                'affectations_existantes': affectations_existantes,
+                'courrier_numero': courrier.numero_registre,
+                'courrier_statut': courrier.statut,
+                'courrier_service_concerne': courrier.service_concerne
+            }, status=status.HTTP_201_CREATED)
+            
+        except Exception as e:
+            return Response(
+                {'error': str(e)}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['get'])
+    def mes_affectations(self, request):
+        """
+        Récupérer les affectations de courriers pour l'utilisateur connecté.
+        URL : GET /api/courriers/mes_affectations/
+        """
+        affectations = AffectationCourrier.objects.filter(
+            utilisateur=request.user
+        ).select_related('courrier', 'affecte_par').order_by('-date_affectation')
+        
+        serializer = AffectationCourrierSerializer(affectations, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def mes_courriers(self, request):
+        """
+        Récupérer les courriers affectés à l'utilisateur connecté.
+        URL : GET /api/courriers/mes_courriers/
+        
+        Permet aux utilisateurs normaux de voir seulement les courriers qui leur sont affectés.
+        """
+        # Récupérer les IDs des courriers affectés à cet utilisateur
+        courriers_affectes_ids = AffectationCourrier.objects.filter(
+            utilisateur=request.user
+        ).values_list('courrier_id', flat=True)
+        
+        # Récupérer les courriers correspondants
+        courriers = Courrier.objects.filter(
+            id__in=courriers_affectes_ids
+        ).order_by('-created_at')
+        
+        # Appliquer les filtres de recherche si fournis
+        search = request.query_params.get('search', None)
+        if search:
+            courriers = courriers.filter(
+                Q(numero_registre__icontains=search) |
+                Q(objet__icontains=search) |
+                Q(expediteur__icontains=search) |
+                Q(destinataire__icontains=search)
+            )
+        
+        # Appliquer l'ordre si fourni
+        ordering = request.query_params.get('ordering', None)
+        if ordering:
+            courriers = courriers.order_by(ordering)
+        
+        serializer = CourrierSerializer(courriers, many=True)
+        return Response(serializer.data)
+    
+    def destroy(self, request, *args, **kwargs):
+        """
+        Archiver (soft delete) un courrier au lieu de le supprimer complètement.
+        URL : DELETE /api/courriers/{id}/
+        """
+        courrier = self.get_object()
+        
+        # Archiver le courrier (soft delete)
+        courrier.soft_delete(request.user)
+        
+        return Response({
+            "message": "Courrier archivé avec succès"
+        }, status=status.HTTP_204_NO_CONTENT)
+    
+    @action(detail=False, methods=['get'])
+    def archives(self, request):
+        """
+        Récupérer tous les courriers archivés (supprimés) accessibles par l'utilisateur.
+        URL : GET /api/courriers/archives/
+        """
+        # Récupérer tous les courriers supprimés
+        user = request.user
+        
+        if user.role == 'admin' or user.role == 'rh':
+            # Les admins et RH voient tous les courriers archivés
+            archived_courriers = Courrier.objects.filter(is_deleted=True)
+        else:
+            # Les utilisateurs ne voient que leurs propres courriers archivés
+            archived_courriers = Courrier.objects.filter(is_deleted=True, enregistre_par=user)
+        
+        # Appliquer les filtres de recherche si nécessaire
+        search_query = request.query_params.get('search', None)
+        if search_query:
+            archived_courriers = archived_courriers.filter(
+                Q(numero_registre__icontains=search_query) |
+                Q(objet__icontains=search_query) |
+                Q(expediteur__icontains=search_query) |
+                Q(destinataire__icontains=search_query)
+            )
+        
+        # Trier par date de suppression (plus récent en premier)
+        archived_courriers = archived_courriers.order_by('-deleted_at')
+        
+        serializer = self.get_serializer(archived_courriers, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['post'])
+    def restore(self, request, pk=None):
+        """
+        Restaurer un courrier archivé.
+        URL : POST /api/courriers/{id}/restore/
+        """
+        # Récupérer le courrier même s'il est supprimé
+        try:
+            courrier = Courrier.objects.get(pk=pk)
+        except Courrier.DoesNotExist:
+            return Response(
+                {"error": "Courrier non trouvé"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Vérifier que le courrier est bien archivé
+        if not courrier.is_deleted:
+            return Response(
+                {"error": "Ce courrier n'est pas archivé"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Restaurer le courrier
+        courrier.restore()
+        
+        serializer = self.get_serializer(courrier)
+        return Response({
+            "message": "Courrier restauré avec succès",
+            "courrier": serializer.data
+        })
+    
+    @action(detail=False, methods=['get'], url_path='archives-status')
+    def archives_status(self, request):
+        """
+        Récupérer tous les courriers avec statut='archive' (courriers traités et classés).
+        URL : GET /api/courriers/archives-status/
+        """
+        user = request.user
+        
+        # Récupérer les courriers archivés (statut='archive') et non supprimés
+        if user.role == 'admin' or user.role == 'rh':
+            # Les admins et RH voient tous les courriers archivés
+            archived_courriers = Courrier.objects.filter(statut='archive', is_deleted=False)
+        else:
+            # Les utilisateurs ne voient que leurs propres courriers archivés
+            archived_courriers = Courrier.objects.filter(
+                statut='archive', 
+                is_deleted=False, 
+                enregistre_par=user
+            )
+        
+        # Appliquer les filtres de recherche si nécessaire
+        search_query = request.query_params.get('search', None)
+        if search_query:
+            archived_courriers = archived_courriers.filter(
+                Q(numero_registre__icontains=search_query) |
+                Q(objet__icontains=search_query) |
+                Q(expediteur__icontains=search_query) |
+                Q(destinataire__icontains=search_query)
+            )
+        
+        # Trier par date de création (plus récent en premier)
+        ordering = request.query_params.get('ordering', '-created_at')
+        archived_courriers = archived_courriers.order_by(ordering)
+        
+        serializer = self.get_serializer(archived_courriers, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['get'])
+    def versions(self, request, pk=None):
+        """
+        Récupérer toutes les versions d'un courrier.
+        URL : GET /api/courriers/{id}/versions/
+        """
+        courrier = self.get_object()
+        
+        # Récupérer toutes les versions de ce courrier
+        if courrier.courrier_parent:
+            # Si c'est une version, récupérer toutes les versions du parent
+            parent = courrier.courrier_parent
+            versions = Courrier.objects.filter(
+                Q(id=parent.id) | Q(courrier_parent=parent)
+            ).order_by('version_number')
+        else:
+            # Si c'est le parent, récupérer lui-même et toutes ses versions
+            versions = Courrier.objects.filter(
+                Q(id=courrier.id) | Q(courrier_parent=courrier)
+            ).order_by('version_number')
+        
+        serializer = self.get_serializer(versions, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def services_disponibles(self, request):
+        """
+        Liste des services disponibles pour l'affectation.
+        URL : GET /api/courriers/services_disponibles/
+        """
+        services = Service.objects.all().order_by('nom')
+        serializer = ServiceSimpleSerializer(services, many=True)
+        return Response(serializer.data)
 
 
 # ============================================================================
@@ -1180,3 +1748,354 @@ class CategorieViewSet(viewsets.ModelViewSet):
         status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
         
         return Response(serializer.data, status=status_code)
+
+
+# ============================================================================
+# UTILITAIRES POUR LA SIGNATURE ÉLECTRONIQUE
+# ============================================================================
+
+def appliquer_signature_pdf(pdf_path, signature_path, position_x, position_y, largeur, hauteur, page_height=842):
+    """
+    Applique une signature électronique sur un PDF.
+    
+    Args:
+        pdf_path: Chemin vers le PDF original
+        signature_path: Chemin vers l'image de signature
+        position_x: Position X (en pixels frontend)
+        position_y: Position Y (en pixels frontend)
+        largeur: Largeur de la signature (en pixels)
+        hauteur: Hauteur de la signature (en pixels)
+        page_height: Hauteur de la zone d'affichage frontend (défaut: 1200px)
+    
+    Returns:
+        BytesIO contenant le PDF signé
+    """
+    # Convertir les coordonnées frontend (pixels) vers coordonnées PDF (points)
+    # PDF utilise points (72 points = 1 inch) et origine en bas-gauche
+    # Frontend utilise pixels et origine en haut-gauche
+    
+    # Facteur de conversion : hauteur de page PDF standard (A4) = 842 points
+    pdf_page_height = 842  # Points pour A4
+    scale_factor = pdf_page_height / page_height  # page_height = 1200px frontend
+    
+    # Convertir position et dimensions
+    x_pdf = position_x * scale_factor
+    y_pdf = pdf_page_height - (position_y * scale_factor) - (hauteur * scale_factor)
+    w_pdf = largeur * scale_factor
+    h_pdf = hauteur * scale_factor
+    
+    # Créer un PDF temporaire avec juste la signature
+    packet = io.BytesIO()
+    can = canvas.Canvas(packet, pagesize=letter)
+    
+    # Ajouter l'image de signature
+    try:
+        img = ImageReader(signature_path)
+        can.drawImage(img, x_pdf, y_pdf, width=w_pdf, height=h_pdf, mask='auto')
+    except Exception as e:
+        print(f"Erreur lors de l'ajout de l'image: {e}")
+    
+    can.save()
+    packet.seek(0)
+    
+    # Lire le PDF original
+    existing_pdf = PdfReader(open(pdf_path, "rb"))
+    signature_pdf = PdfReader(packet)
+    
+    # Créer le PDF de sortie
+    output = PdfWriter()
+    
+    # Fusionner la signature avec la première page
+    page = existing_pdf.pages[0]
+    page.merge_page(signature_pdf.pages[0])
+    output.add_page(page)
+    
+    # Ajouter les autres pages sans modification
+    for i in range(1, len(existing_pdf.pages)):
+        output.add_page(existing_pdf.pages[i])
+    
+    # Écrire dans un BytesIO
+    output_stream = io.BytesIO()
+    output.write(output_stream)
+    output_stream.seek(0)
+    
+    return output_stream
+
+
+# ============================================================================
+# VIEWSETS POUR LES AFFECTATIONS DE COURRIERS
+# ============================================================================
+
+class AffectationCourrierViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet pour gérer les affectations de courriers.
+    
+    Fonctionnalités :
+    - CRUD complet des affectations
+    - Marquer comme lu
+    - Valider/Rejeter/Signer
+    - Ajouter des commentaires
+    """
+    queryset = AffectationCourrier.objects.all()
+    serializer_class = AffectationCourrierSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, rest_filters.OrderingFilter]
+    ordering_fields = ['date_affectation', 'date_lecture', 'statut']
+    ordering = ['-date_affectation']
+    
+    def get_queryset(self):
+        """
+        Filtrer les affectations selon l'utilisateur :
+        - Utilisateurs normaux : seulement leurs affectations
+        - RH/Admin : toutes les affectations
+        """
+        user = self.request.user
+        if user.role in ['rh', 'admin']:
+            return AffectationCourrier.objects.all()
+        else:
+            return AffectationCourrier.objects.filter(utilisateur=user)
+    
+    @action(detail=True, methods=['post'])
+    def marquer_lu(self, request, pk=None):
+        """
+        Marquer une affectation comme lue.
+        URL : POST /api/affectations/{id}/marquer_lu/
+        """
+        affectation = self.get_object()
+        
+        # Vérifier que c'est bien l'utilisateur concerné
+        if affectation.utilisateur != request.user:
+            return Response(
+                {'error': 'Vous ne pouvez modifier que vos propres affectations'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        affectation.marquer_comme_lu()
+        
+        serializer = self.get_serializer(affectation)
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['post'])
+    def valider(self, request, pk=None):
+        """
+        Valider une affectation de courrier.
+        URL : POST /api/affectations/{id}/valider/
+        Body : { "commentaire": "Validé après vérification" }
+        """
+        affectation = self.get_object()
+        
+        if affectation.utilisateur != request.user:
+            return Response(
+                {'error': 'Vous ne pouvez modifier que vos propres affectations'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        commentaire = request.data.get('commentaire', '')
+        affectation.valider(commentaire)
+        
+        serializer = self.get_serializer(affectation)
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['post'])
+    def rejeter(self, request, pk=None):
+        """
+        Rejeter une affectation de courrier.
+        URL : POST /api/affectations/{id}/rejeter/
+        Body : { "motif": "Document incomplet" }
+        """
+        affectation = self.get_object()
+        
+        if affectation.utilisateur != request.user:
+            return Response(
+                {'error': 'Vous ne pouvez modifier que vos propres affectations'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        motif = request.data.get('motif', '')
+        if not motif:
+            return Response(
+                {'error': 'Le motif de rejet est obligatoire'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        affectation.rejeter(motif)
+        
+        serializer = self.get_serializer(affectation)
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['post'])
+    def signer(self, request, pk=None):
+        """
+        Signer électroniquement une affectation de courrier.
+        URL : POST /api/affectations/{id}/signer/
+        Body : { 
+            "commentaire": "Signé électroniquement",
+            "position": {"x": 100, "y": 200},
+            "size": {"width": 200, "height": 80}
+        }
+        """
+        affectation = self.get_object()
+        
+        if affectation.utilisateur != request.user:
+            return Response(
+                {'error': 'Vous ne pouvez modifier que vos propres affectations'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Vérifier que l'utilisateur a une signature configurée
+        if not request.user.signature_electronique:
+            return Response(
+                {'error': 'Vous devez configurer votre signature électronique'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        commentaire = request.data.get('commentaire', 'Signé électroniquement')
+        position = request.data.get('position', {})
+        size = request.data.get('size', {})
+        
+        # Récupérer le courrier associé
+        courrier = affectation.courrier
+        
+        # Vérifier que le courrier a un fichier PDF
+        if not courrier.fichier:
+            return Response(
+                {'error': 'Ce courrier n\'a pas de fichier PDF'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            # Appliquer la signature sur le PDF
+            pdf_signe = appliquer_signature_pdf(
+                pdf_path=courrier.fichier.path,
+                signature_path=request.user.signature_electronique.path,
+                position_x=position.get('x', 100),
+                position_y=position.get('y', 100),
+                largeur=size.get('width', 200),
+                hauteur=size.get('height', 80),
+                page_height=1200  # Hauteur du conteneur frontend
+            )
+            
+            # Sauvegarder le PDF signé
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"courrier_{courrier.numero_registre}_signe_{timestamp}.pdf"
+            
+            courrier.fichier.save(
+                filename,
+                ContentFile(pdf_signe.read()),
+                save=True
+            )
+            
+            # Marquer l'affectation comme signée
+            affectation.signer(commentaire)
+            
+            serializer = self.get_serializer(affectation)
+            return Response(serializer.data)
+            
+        except Exception as e:
+            return Response(
+                {'error': f'Erreur lors de l\'application de la signature: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=True, methods=['get', 'post'])
+    def commentaires(self, request, pk=None):
+        """
+        Récupérer (GET) ou ajouter (POST) des commentaires sur une affectation.
+        URL : 
+        - GET /api/affectations/{id}/commentaires/
+        - POST /api/affectations/{id}/commentaires/
+        Body (POST) : { "contenu": "Mon commentaire..." }
+        """
+        affectation = self.get_object()
+        
+        if request.method == 'GET':
+            commentaires = affectation.commentaires.all()
+            serializer = CommentaireCourrierSerializer(commentaires, many=True)
+            return Response(serializer.data)
+        
+        elif request.method == 'POST':
+            contenu = request.data.get('contenu', '').strip()
+            
+            if not contenu:
+                return Response(
+                    {'error': 'Le contenu du commentaire est obligatoire'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            commentaire = CommentaireCourrier.objects.create(
+                affectation=affectation,
+                auteur=request.user,
+                contenu=contenu
+            )
+            
+            # Notifier les autres utilisateurs concernés par ce courrier
+            from users.utils import creer_notification
+            
+            # Récupérer tous les utilisateurs qui ont des affectations sur ce courrier, sauf l'auteur du commentaire
+            utilisateurs_concernes = affectation.courrier.affectations.exclude(
+                utilisateur=request.user
+            ).values_list('utilisateur', flat=True).distinct()
+            
+            for utilisateur_id in utilisateurs_concernes:
+                try:
+                    creer_notification(
+                        utilisateur=utilisateur_id,
+                        type_notif='commentaire',
+                        titre=f'Nouveau commentaire: {affectation.courrier.numero_registre}',
+                        message=f'{request.user.get_full_name() or request.user.username} a ajouté un commentaire sur le courrier "{affectation.courrier.objet}".',
+                        courrier_id=affectation.courrier.id,
+                    )
+                except Exception as e:
+                    print(f"Erreur lors de la création de notification: {e}")
+            
+            serializer = CommentaireCourrierSerializer(commentaire)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class CommentaireCourrierViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet pour gérer les commentaires sur les affectations
+    """
+    queryset = CommentaireCourrier.objects.all()
+    serializer_class = CommentaireCourrierSerializer
+    permission_classes = [IsAuthenticated]
+    ordering = ['-date_creation']
+    
+    def get_queryset(self):
+        """
+        Filtrer les commentaires selon l'utilisateur :
+        - Utilisateurs normaux : commentaires de leurs affectations seulement
+        - RH/Admin : tous les commentaires
+        """
+        user = self.request.user
+        if user.role in ['rh', 'admin']:
+            return CommentaireCourrier.objects.all()
+        else:
+            # Commentaires sur les affectations de cet utilisateur ou faits par lui
+            return CommentaireCourrier.objects.filter(
+                Q(affectation__utilisateur=user) | Q(auteur=user)
+            )
+    
+    def perform_create(self, serializer):
+        """Attribuer l'auteur automatiquement et notifier les autres utilisateurs concernés"""
+        commentaire = serializer.save(auteur=self.request.user)
+        
+        # Notifier les autres utilisateurs concernés par ce courrier
+        from users.utils import creer_notification
+        
+        # Récupérer tous les utilisateurs qui ont des affectations sur ce courrier, sauf l'auteur du commentaire
+        utilisateurs_concernes = commentaire.affectation.courrier.affectations.exclude(
+            utilisateur=self.request.user
+        ).values_list('utilisateur', flat=True).distinct()
+        
+        for utilisateur_id in utilisateurs_concernes:
+            try:
+                creer_notification(
+                    utilisateur=utilisateur_id,
+                    type_notif='commentaire',
+                    titre=f'Nouveau commentaire: {commentaire.affectation.courrier.numero_registre}',
+                    message=f'{self.request.user.get_full_name() or self.request.user.username} a ajouté un commentaire sur le courrier "{commentaire.affectation.courrier.objet}".',
+                    courrier_id=commentaire.affectation.courrier.id,
+                )
+            except Exception as e:
+                print(f"Erreur lors de la création de notification: {e}")

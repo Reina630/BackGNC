@@ -1,6 +1,9 @@
 from rest_framework import serializers
-from .models import Document, DocumentVersion, DocumentShare, ShareRequest, Courrier, PartageLog, Categorie
-from users.models import User
+from .models import (
+    Document, DocumentVersion, DocumentShare, ShareRequest, 
+    Courrier, PartageLog, Categorie, AffectationCourrier, CommentaireCourrier
+)
+from users.models import User, Service
 from tags.serializers import TagSerializer
 
 
@@ -160,6 +163,9 @@ class CourrierSerializer(serializers.ModelSerializer):
     # Date principale (date_reception pour entrant, date_envoi pour sortant)
     date_principale = serializers.SerializerMethodField()
     
+    # URL complète du fichier
+    fichier_url = serializers.SerializerMethodField()
+    
     # Gestion des versions
     version_label = serializers.SerializerMethodField()
     nombre_versions = serializers.SerializerMethodField()
@@ -187,6 +193,7 @@ class CourrierSerializer(serializers.ModelSerializer):
             'statut',
             'statut_display',
             'fichier',
+            'fichier_url',
             'file_type',
             'file_size',
             'notes',
@@ -222,6 +229,17 @@ class CourrierSerializer(serializers.ModelSerializer):
         """
         date = obj.get_date_principale()
         return date.isoformat() if date else None
+    
+    def get_fichier_url(self, obj):
+        """
+        Retourne l'URL complète du fichier
+        """
+        if obj.fichier:
+            request = self.context.get('request')
+            if request is not None:
+                return request.build_absolute_uri(obj.fichier.url)
+            return obj.fichier.url
+        return None
     
     def get_version_label(self, obj):
         """Retourne le label de version (V1, V2, V3...)"""
@@ -377,3 +395,137 @@ class PartageLogCreateSerializer(serializers.ModelSerializer):
         if not value or not value.strip():
             raise serializers.ValidationError("Le destinataire est obligatoire.")
         return value.strip()
+
+
+# ============================================================================
+# SERIALIZERS POUR LES AFFECTATIONS DE COURRIERS
+# ============================================================================
+
+class AffectationCourrierSerializer(serializers.ModelSerializer):
+    """
+    Serializer complet pour les affectations de courriers
+    """
+    # Informations sur le courrier
+    courrier_details = CourrierSerializer(source='courrier', read_only=True)
+    courrier_numero = serializers.CharField(source='courrier.numero_registre', read_only=True)
+    courrier_objet = serializers.CharField(source='courrier.objet', read_only=True)
+    
+    # Informations sur l'utilisateur affecté
+    utilisateur_username = serializers.CharField(source='utilisateur.username', read_only=True)
+    utilisateur_nom_complet = serializers.SerializerMethodField()
+    utilisateur_service = serializers.CharField(source='utilisateur.service.nom', read_only=True)
+    
+    # Informations sur qui a fait l'affectation
+    affecte_par_username = serializers.CharField(source='affecte_par.username', read_only=True)
+    affecte_par_nom_complet = serializers.SerializerMethodField()
+    
+    # Statut avec libellé
+    statut_display = serializers.CharField(source='get_statut_display', read_only=True)
+    
+    # Compteurs
+    nb_commentaires = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = AffectationCourrier
+        fields = [
+            'id',
+            'courrier',
+            'courrier_details',
+            'courrier_numero',
+            'courrier_objet',
+            'utilisateur',
+            'utilisateur_username',
+            'utilisateur_nom_complet',
+            'utilisateur_service',
+            'affecte_par',
+            'affecte_par_username',
+            'affecte_par_nom_complet',
+            'note',
+            'statut',
+            'statut_display',
+            'commentaire_traitement',
+            'motif_rejet',
+            'nb_commentaires',
+            'date_affectation',
+            'date_lecture',
+            'date_traitement',
+        ]
+        read_only_fields = [
+            'affecte_par',
+            'date_affectation',
+            'date_lecture',
+            'date_traitement'
+        ]
+    
+    def get_utilisateur_nom_complet(self, obj):
+        """Retourne le nom complet de l'utilisateur affecté"""
+        if obj.utilisateur.first_name and obj.utilisateur.last_name:
+            return f"{obj.utilisateur.first_name} {obj.utilisateur.last_name}"
+        return obj.utilisateur.username
+    
+    def get_affecte_par_nom_complet(self, obj):
+        """Retourne le nom complet de celui qui a fait l'affectation"""
+        if not obj.affecte_par:
+            return None
+        if obj.affecte_par.first_name and obj.affecte_par.last_name:
+            return f"{obj.affecte_par.first_name} {obj.affecte_par.last_name}"
+        return obj.affecte_par.username
+    
+    def get_nb_commentaires(self, obj):
+        """Retourne le nombre de commentaires sur cette affectation"""
+        return obj.commentaires.count()
+
+
+class AffectationCourrierCreateSerializer(serializers.ModelSerializer):
+    """
+    Serializer pour créer une nouvelle affectation
+    """
+    class Meta:
+        model = AffectationCourrier
+        fields = [
+            'courrier',
+            'utilisateur',
+            'note'
+        ]
+
+
+class CommentaireCourrierSerializer(serializers.ModelSerializer):
+    """
+    Serializer pour les commentaires sur les affectations
+    """
+    auteur_username = serializers.CharField(source='auteur.username', read_only=True)
+    auteur_nom_complet = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = CommentaireCourrier
+        fields = [
+            'id',
+            'affectation',
+            'auteur',
+            'auteur_username',
+            'auteur_nom_complet',
+            'contenu',
+            'date_creation'
+        ]
+        read_only_fields = ['auteur', 'date_creation']
+    
+    def get_auteur_nom_complet(self, obj):
+        """Retourne le nom complet de l'auteur du commentaire"""
+        if obj.auteur.first_name and obj.auteur.last_name:
+            return f"{obj.auteur.first_name} {obj.auteur.last_name}"
+        return obj.auteur.username
+
+
+class ServiceSimpleSerializer(serializers.ModelSerializer):
+    """
+    Serializer simple pour les services
+    """
+    nb_utilisateurs = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = Service
+        fields = ['id', 'nom', 'description', 'nb_utilisateurs']
+    
+    def get_nb_utilisateurs(self, obj):
+        """Retourne le nombre d'utilisateurs dans ce service"""
+        return obj.utilisateurs.count()

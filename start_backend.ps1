@@ -1,7 +1,7 @@
-# Script de démarrage du backend GED avec l'app courriers
+# Script de démarrage du backend GED avec système de courriers intégré
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  Configuration de l'app Courriers" -ForegroundColor Cyan
+Write-Host "  Démarrage du système GED complet" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -11,8 +11,8 @@ Write-Host "Activation de l'environnement virtuel..." -ForegroundColor Yellow
 
 # Migrations
 Write-Host ""
-Write-Host "Création des migrations pour l'app courriers..." -ForegroundColor Yellow
-python manage.py makemigrations courriers
+Write-Host "Création des migrations..." -ForegroundColor Yellow
+python manage.py makemigrations
 
 Write-Host ""
 Write-Host "Application des migrations..." -ForegroundColor Yellow
@@ -33,7 +33,9 @@ Write-Host "========================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "Le serveur sera accessible sur: http://localhost:8000" -ForegroundColor Cyan
 Write-Host "Admin: http://localhost:8000/admin" -ForegroundColor Cyan
+Write-Host "API Documents: http://localhost:8000/api/" -ForegroundColor Cyan
 Write-Host "API Courriers: http://localhost:8000/api/courriers/" -ForegroundColor Cyan
+Write-Host "API Affectations: http://localhost:8000/api/affectations/" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Appuyez sur Ctrl+C pour arrêter le serveur" -ForegroundColor Gray
 Write-Host ""

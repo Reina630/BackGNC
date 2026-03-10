@@ -1,6 +1,9 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import DocumentViewSet, DocumentShareViewSet, ShareRequestViewSet, CourrierViewSet, CategorieViewSet
+from .views import (
+    DocumentViewSet, DocumentShareViewSet, ShareRequestViewSet, 
+    CourrierViewSet, CategorieViewSet, AffectationCourrierViewSet, CommentaireCourrierViewSet
+)
 from .partage_views import PartageLogViewSet
 
 # Configuration du routeur pour les endpoints API
@@ -22,6 +25,14 @@ router.register(r'categories', CategorieViewSet, basename='categorie')
 # Endpoint pour l'historique des partages
 # URL: /api/partages/
 router.register(r'partages', PartageLogViewSet, basename='partage')
+
+# NOUVEAU : Endpoints pour les affectations de courriers
+# URL : /api/affectations/
+router.register(r'affectations', AffectationCourrierViewSet, basename='affectation')
+
+# Endpoint pour les commentaires d'affectations
+# URL: /api/commentaires-courriers/  
+router.register(r'commentaires-courriers', CommentaireCourrierViewSet, basename='commentaire-courrier')
 
 urlpatterns = [
     path('', include(router.urls)),
