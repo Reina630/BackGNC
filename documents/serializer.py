@@ -151,6 +151,10 @@ class CourrierSerializer(serializers.ModelSerializer):
     type_courrier_display = serializers.CharField(source='get_type_courrier_display', read_only=True)
     statut_display = serializers.CharField(source='get_statut_display', read_only=True)
     service_concerne_display = serializers.CharField(source='get_service_concerne_display', read_only=True)
+    mode_reception_display = serializers.CharField(source='get_mode_reception_display', read_only=True)
+    mode_envoi_display = serializers.CharField(source='get_mode_envoi_display', read_only=True)
+    service_emetteur_display = serializers.CharField(source='get_service_emetteur_display', read_only=True)
+    service_destinataire_display = serializers.CharField(source='get_service_destinataire_display', read_only=True)
     
     # Informations sur l'utilisateur qui a enregistré le courrier
     enregistre_par_details = UserSimpleSerializer(source='enregistre_par', read_only=True)
@@ -179,10 +183,19 @@ class CourrierSerializer(serializers.ModelSerializer):
             'type_courrier',
             'type_courrier_display',
             'date_reception',
+            'mode_reception',
+            'mode_reception_display',
             'date_envoi',
+            'mode_envoi',
+            'mode_envoi_display',
+            'date_circulation',
             'date_principale',
             'expediteur',
             'destinataire',
+            'service_emetteur',
+            'service_emetteur_display',
+            'service_destinataire',
+            'service_destinataire_display',
             'objet',
             'reference',
             'categorie',

@@ -7,6 +7,7 @@ from datetime import datetime
 from django.core.files.base import ContentFile
 from django.db.models import Q
 from django.http import FileResponse
+from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from django_filters import rest_framework as filters
 
@@ -1788,12 +1789,20 @@ def appliquer_signature_pdf(pdf_path, signature_path, position_x, position_y, la
     packet = io.BytesIO()
     can = canvas.Canvas(packet, pagesize=letter)
     
+    # Vérifier que le fichier de signature existe
+    import os
+    if not os.path.exists(signature_path):
+        raise FileNotFoundError(f"Le fichier de signature n'existe pas : {signature_path}")
+    
     # Ajouter l'image de signature
     try:
-        img = ImageReader(signature_path)
+        # Utiliser un chemin absolu avec normalisation
+        signature_abs_path = os.path.abspath(signature_path)
+        img = ImageReader(signature_abs_path)
         can.drawImage(img, x_pdf, y_pdf, width=w_pdf, height=h_pdf, mask='auto')
     except Exception as e:
         print(f"Erreur lors de l'ajout de l'image: {e}")
+        raise Exception(f"Impossible de charger l'image de signature : {str(e)}")
     
     can.save()
     packet.seek(0)
@@ -1975,23 +1984,77 @@ class AffectationCourrierViewSet(viewsets.ModelViewSet):
                 page_height=1200  # Hauteur du conteneur frontend
             )
             
-            # Sauvegarder le PDF signé
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"courrier_{courrier.numero_registre}_signe_{timestamp}.pdf"
+            # Import du modèle FichierCourrierVersion
+            from documents.models import FichierCourrierVersion
             
-            courrier.fichier.save(
-                filename,
-                ContentFile(pdf_signe.read()),
-                save=True
+            # Déterminer le numéro de la nouvelle version
+            derniere_version = courrier.fichier_versions.order_by('-version_number').first()
+            
+            if derniere_version:
+                nouveau_numero = derniere_version.version_number + 1
+            else:
+                # Première version : sauvegarder d'abord le fichier original comme V1
+                from django.core.files.base import File
+                with open(courrier.fichier.path, 'rb') as f:
+                    fichier_original = File(f)
+                    fichier_content = fichier_original.read()
+                    
+                FichierCourrierVersion.objects.create(
+                    courrier=courrier,
+                    fichier=ContentFile(fichier_content, name=f"{courrier.numero_registre}_v1.pdf"),
+                    version_number=1,
+                    notes_version="Version originale",
+                    est_version_actuelle=False,  # L'originale n'est plus actuelle
+                    cree_par=courrier.enregistre_par
+                )
+                nouveau_numero = 2
+            
+            # Désactiver toutes les versions précédentes
+            courrier.fichier_versions.update(est_version_actuelle=False)
+            
+            # Créer la nouvelle version avec le PDF signé
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"{courrier.numero_registre}_v{nouveau_numero}_{timestamp}.pdf"
+            notes_version = f"Signé par {request.user.get_full_name() or request.user.username} le {datetime.now().strftime('%d/%m/%Y à %H:%M')}"
+            
+            pdf_signe_file = ContentFile(pdf_signe.read(), name=filename)
+            
+            FichierCourrierVersion.objects.create(
+                courrier=courrier,
+                fichier=pdf_signe_file,
+                version_number=nouveau_numero,
+                notes_version=notes_version,
+                est_version_actuelle=True,
+                cree_par=request.user
             )
+            
+            # Remplacer le fichier principal du courrier par le fichier signé
+            # Sauvegarder d'abord le nom d'origine pour le delete
+            ancien_fichier = courrier.fichier.name
+            
+            # Créer une nouvelle copie pour le champ principal
+            pdf_signe.seek(0)  # Reset file pointer
+            courrier.fichier.save(filename, ContentFile(pdf_signe.read()), save=False)
+            courrier.save()
+            
+            # Optionnel : supprimer l'ancien fichier principal (pas les versions)
+            # depuis le système de fichiers pour économiser l'espace
+            # (décommenter si souhaité)
+            # import os
+            # if ancien_fichier and os.path.exists(ancien_fichier):
+            #     os.remove(ancien_fichier)
             
             # Marquer l'affectation comme signée
             affectation.signer(commentaire)
+            
+            print(f"✅ Version {nouveau_numero} créée pour le courrier {courrier.numero_registre}")
             
             serializer = self.get_serializer(affectation)
             return Response(serializer.data)
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return Response(
                 {'error': f'Erreur lors de l\'application de la signature: {str(e)}'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -2028,28 +2091,147 @@ class AffectationCourrierViewSet(viewsets.ModelViewSet):
                 contenu=contenu
             )
             
-            # Notifier les autres utilisateurs concernés par ce courrier
+            # Notifier tous les utilisateurs (pour démo)
             from users.utils import creer_notification
             
-            # Récupérer tous les utilisateurs qui ont des affectations sur ce courrier, sauf l'auteur du commentaire
-            utilisateurs_concernes = affectation.courrier.affectations.exclude(
-                utilisateur=request.user
-            ).values_list('utilisateur', flat=True).distinct()
+            # Récupérer tous les utilisateurs actifs sauf l'auteur du commentaire
+            utilisateurs_concernes = User.objects.filter(
+                is_active=True
+            ).exclude(id=request.user.id)
             
-            for utilisateur_id in utilisateurs_concernes:
+            print(f"Nb utilisateurs à notifier: {utilisateurs_concernes.count()}")  # Debug
+            
+            for utilisateur in utilisateurs_concernes:
                 try:
-                    creer_notification(
-                        utilisateur=utilisateur_id,
+                    notif = creer_notification(
+                        utilisateur=utilisateur,
                         type_notif='commentaire',
                         titre=f'Nouveau commentaire: {affectation.courrier.numero_registre}',
                         message=f'{request.user.get_full_name() or request.user.username} a ajouté un commentaire sur le courrier "{affectation.courrier.objet}".',
                         courrier_id=affectation.courrier.id,
                     )
+                    print(f"Notification créée pour {utilisateur.username}: {notif.id}")  # Debug
                 except Exception as e:
-                    print(f"Erreur lors de la création de notification: {e}")
+                    print(f"Erreur lors de la création de notification pour {utilisateur.username}: {e}")
             
             serializer = CommentaireCourrierSerializer(commentaire)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
+    
+    @action(detail=True, methods=['post'])
+    def reaffecter(self, request, pk=None):
+        """
+        Réaffecter un courrier à un autre service.
+        Identique à l'affectation initiale mais change le service concerné.
+        URL : POST /api/affectations/{id}/reaffecter/
+        Body : { 
+            "service_id": 123,  # ID du nouveau service
+            "mode": "plateforme" ou "email"
+        }
+        """
+        affectation = self.get_object()
+        
+        # Vérifier que c'est bien l'utilisateur concerné qui réaffecte
+        if affectation.utilisateur != request.user:
+            return Response(
+                {'error': 'Vous ne pouvez réaffecter que vos propres affectations'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        service_id = request.data.get('service_id')
+        mode = request.data.get('mode', 'plateforme')
+        
+        if not service_id:
+            return Response(
+                {'error': 'Vous devez spécifier un service'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        courrier = affectation.courrier
+        
+        try:
+            # Récupérer le nouveau service
+            from users.models import Service
+            nouveau_service = Service.objects.get(id=service_id)
+            ancien_service_nom = courrier.get_service_concerne_display() if courrier.service_concerne else "Non défini"
+            
+            # Mapper le nom du service vers le code
+            service_mapping = {
+                'Ressources Humaines': 'rh',
+                'RH': 'rh',
+                'Comptabilité': 'comptabilite',
+                'Direction': 'direction',
+                'Direction Générale': 'direction',
+                'Service Technique': 'technique',
+                'Technique': 'technique',
+                'Commercial': 'commercial',
+                'Juridique': 'juridique',
+                'Informatique': 'informatique',
+                'IT': 'informatique',
+                'Logistique': 'logistique',
+            }
+            
+            # Obtenir le code du service
+            service_code = service_mapping.get(nouveau_service.nom, 'autre')
+            
+            # Modifier le service concerné du courrier
+            courrier.service_concerne = service_code
+            courrier.save()
+            
+            # Marquer l'ancienne affectation comme transférée
+            affectation.statut = 'valide'
+            affectation.commentaire_traitement = f"Transféré au service {nouveau_service.nom}"
+            affectation.date_traitement = timezone.now()
+            affectation.save()
+            
+            # Créer de nouvelles affectations pour tous les utilisateurs du nouveau service
+            utilisateurs_service = nouveau_service.utilisateurs.filter(is_active=True)
+            
+            if not utilisateurs_service.exists():
+                return Response(
+                    {'error': f'Aucun utilisateur actif trouvé dans le service {nouveau_service.nom}'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            nouvelles_affectations = []
+            from users.utils import creer_notification
+            
+            for utilisateur in utilisateurs_service:
+                nouvelle_affectation = AffectationCourrier.objects.create(
+                    courrier=courrier,
+                    utilisateur=utilisateur,
+                    affecte_par=request.user,
+                    note=f"Transféré de {ancien_service_nom} par {request.user.get_full_name() or request.user.username}",
+                    statut='en_attente'
+                )
+                nouvelles_affectations.append(nouvelle_affectation)
+                
+                # Notifier chaque utilisateur
+                creer_notification(
+                    utilisateur=utilisateur,
+                    type_notif='affectation',
+                    titre=f'Courrier transféré: {courrier.numero_registre}',
+                    message=f'{request.user.get_full_name() or request.user.username} a transféré le courrier "{courrier.objet}" à votre service.',
+                    courrier_id=courrier.id,
+                )
+            
+            return Response({
+                'message': f'Courrier réaffecté au service {nouveau_service.nom}',
+                'nb_affectations': len(nouvelles_affectations),
+                'service': nouveau_service.nom
+            }, status=status.HTTP_200_OK)
+                
+        except Service.DoesNotExist:
+            return Response(
+                {'error': 'Service introuvable'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return Response(
+                {'error': f'Erreur lors de la réaffectation: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 
 class CommentaireCourrierViewSet(viewsets.ModelViewSet):

@@ -173,6 +173,16 @@ class Courrier(models.Model):
         ('autre', 'Autre'),
     ]
     
+    # Choix pour le mode de réception/envoi
+    MODE_CHOICES = [
+        ('postal', 'Courrier postal'),
+        ('email', 'Email'),
+        ('fax', 'Fax'),
+        ('main_propre', 'Remise en main propre'),
+        ('coursier', 'Coursier'),
+        ('autre', 'Autre'),
+    ]
+    
     # ===== IDENTIFICATION =====
     # Numéro unique généré automatiquement (ex: 2026-0001, 2026-0002...)
     numero_registre = models.CharField(
@@ -196,6 +206,15 @@ class Courrier(models.Model):
         help_text="Date de réception du courrier entrant"
     )
     
+    # Mode de réception (pour courrier entrant)
+    mode_reception = models.CharField(
+        max_length=50,
+        choices=MODE_CHOICES,
+        blank=True,
+        default='',
+        help_text="Mode de réception du courrier entrant"
+    )
+    
     # Date d'envoi (pour courrier sortant)
     date_envoi = models.DateField(
         null=True, 
@@ -203,19 +222,53 @@ class Courrier(models.Model):
         help_text="Date d'envoi du courrier sortant"
     )
     
+    # Mode d'envoi (pour courrier sortant)
+    mode_envoi = models.CharField(
+        max_length=50,
+        choices=MODE_CHOICES,
+        blank=True,
+        default='',
+        help_text="Mode d'envoi du courrier sortant"
+    )
+    
+    # Date de circulation (pour courrier interne)
+    date_circulation = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Date de circulation du courrier interne"
+    )
+    
     # ===== PARTIES PRENANTES =====
     expediteur = models.CharField(
         max_length=255,
         blank=True,
         default='',
-        help_text="Nom ou organisation de l'expéditeur"
+        help_text="Nom ou organisation de l'expéditeur (courrier entrant)"
     )
     
     destinataire = models.CharField(
         max_length=255,
         blank=True,
         default='',
-        help_text="Nom ou organisation du destinataire"
+        help_text="Nom ou organisation du destinataire (courrier sortant)"
+    )
+    
+    # Service émetteur (pour courrier interne)
+    service_emetteur = models.CharField(
+        max_length=50,
+        choices=SERVICE_CHOICES,
+        blank=True,
+        default='',
+        help_text="Service émetteur (courrier interne)"
+    )
+    
+    # Service destinataire (pour courrier interne)
+    service_destinataire = models.CharField(
+        max_length=50,
+        choices=SERVICE_CHOICES,
+        blank=True,
+        default='',
+        help_text="Service destinataire (courrier interne)"
     )
     
     # ===== CONTENU =====
@@ -375,12 +428,14 @@ class Courrier(models.Model):
     def get_date_principale(self):
         """
         Retourne la date principale du courrier
-        (date de réception pour entrant, date d'envoi pour sortant)
+        (date de réception pour entrant, date d'envoi pour sortant, date de circulation pour interne)
         """
         if self.type_courrier == 'entrant':
             return self.date_reception
-        else:
+        elif self.type_courrier == 'sortant':
             return self.date_envoi
+        else:  # interne
+            return self.date_circulation
     
     def get_version_label(self):
         """
@@ -436,9 +491,14 @@ class Courrier(models.Model):
             est_version_actuelle=True,
             type_courrier=parent.type_courrier,
             date_reception=parent.date_reception,
+            mode_reception=parent.mode_reception,
             date_envoi=parent.date_envoi,
+            mode_envoi=parent.mode_envoi,
+            date_circulation=parent.date_circulation,
             expediteur=parent.expediteur,
             destinataire=parent.destinataire,
+            service_emetteur=parent.service_emetteur,
+            service_destinataire=parent.service_destinataire,
             objet=parent.objet,
             reference=parent.reference,
             service_concerne=parent.service_concerne,
@@ -502,6 +562,62 @@ class Courrier(models.Model):
         
         # Par défaut, retourner 'autre'
         return 'autre'
+
+
+class FichierCourrierVersion(models.Model):
+    """
+    Modèle pour stocker les différentes versions d'un fichier de courrier.
+    Permet de garder l'historique des modifications (signature, annotation, etc.)
+    sans créer de nouvelles entrées de courrier.
+    """
+    courrier = models.ForeignKey(
+        Courrier,
+        on_delete=models.CASCADE,
+        related_name='fichier_versions',
+        help_text="Courrier auquel appartient cette version"
+    )
+    
+    fichier = models.FileField(
+        upload_to='courriers/versions/%Y/%m/',
+        help_text="Fichier de cette version"
+    )
+    
+    version_number = models.PositiveIntegerField(
+        help_text="Numéro de version (1, 2, 3...)"
+    )
+    
+    notes_version = models.TextField(
+        blank=True,
+        help_text="Notes décrivant cette version (ex: 'Signé par X', 'Annoté le...')"
+    )
+    
+    est_version_actuelle = models.BooleanField(
+        default=False,
+        help_text="Indique si c'est la version active affichée"
+    )
+    
+    cree_par = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='versions_courrier_crees',
+        help_text="Utilisateur ayant créé cette version"
+    )
+    
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+        help_text="Date et heure de création de cette version"
+    )
+    
+    class Meta:
+        ordering = ['-version_number']
+        verbose_name = "Version de fichier courrier"
+        verbose_name_plural = "Versions de fichiers courrier"
+        unique_together = ['courrier', 'version_number']
+    
+    def __str__(self):
+        return f"{self.courrier.numero_registre} - V{self.version_number}"
 
 
 class PartageLog(models.Model):
