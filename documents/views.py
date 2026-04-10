@@ -27,8 +27,9 @@ from rest_framework.response import Response
 
 from .filters import DocumentFilter
 from .models import (
-    Document, DocumentVersion, DocumentShare, ShareRequest, 
-    Courrier, PartageLog, Categorie, AffectationCourrier, CommentaireCourrier
+    Document, DocumentVersion, DocumentShare, ShareRequest,
+    Courrier, PartageLog, Categorie, AffectationCourrier, CommentaireCourrier,
+    CourrierPieceJointe, ActionLog
 )
 from .serializer import (
     DocumentSerializer, 
@@ -38,8 +39,7 @@ from .serializer import (
     CourrierSerializer,
     CourrierCreateSerializer,
     CourrierUpdateSerializer,
-    PartageLogSerializer,
-    PartageLogCreateSerializer,
+    
     CategorieSerializer,
     AffectationCourrierSerializer,
     CommentaireCourrierSerializer,
@@ -883,10 +883,10 @@ class CourrierViewSet(viewsets.ModelViewSet):
     def get_permissions(self):
         """
         Permissions variables selon l'action :
-        - Actions accessibles à tous les utilisateurs authentifiés : mes_affectations, services_disponibles, mes_courriers
+        - Actions accessibles à tous les utilisateurs authentifiés : list, retrieve, mes_affectations, services_disponibles, mes_courriers
         - Autres actions : RH et Admin seulement
         """
-        if self.action in ['mes_affectations', 'services_disponibles', 'mes_courriers']:
+        if self.action in ['list', 'retrieve', 'mes_affectations', 'services_disponibles', 'mes_courriers']:
             # Actions accessibles aux utilisateurs normaux
             permission_classes = [IsAuthenticated]
         else:
@@ -911,48 +911,102 @@ class CourrierViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """
         Retourne les courriers en filtrant les courriers supprimés par défaut.
+        Filtre aussi selon le rôle de l'utilisateur :
+        - RH/Admin : tous les courriers
+        - Autres : courriers de leur service ou qui leur sont affectés
         L'action 'archives' et 'restore' peuvent accéder aux courriers supprimés.
         """
+        user = self.request.user
+        
         # Pour l'action archives et restore, on veut les courriers supprimés
         if self.action in ['archives', 'restore']:
             return Courrier.objects.filter(is_deleted=True)
         
         # Par défaut, on ne montre que les courriers non supprimés
-        return Courrier.objects.filter(is_deleted=False)
+        queryset = Courrier.objects.filter(is_deleted=False).select_related(
+            'circuit_affectation'
+        ).prefetch_related(
+            'circuit_affectation__affectations_service',
+            'circuit_affectation__affectations_service__service',
+            'affectations',
+            'affectations__utilisateur',
+            'affectations__utilisateur__service',
+            'circuits_v2',
+            'circuits_v2__affectations',
+            'circuits_v2__affectations__destinataire',
+            'circuits_v2__affectations__service',
+            'affectations_v2',
+            'affectations_v2__destinataire',
+            'affectations_v2__service',
+        )
+        
+        # Filtrage selon le rôle pour list et retrieve
+        if self.action in ['list', 'retrieve']:
+            if user.role not in ['rh', 'admin']:
+                # Utilisateurs normaux voient :
+                # - Courriers de leur service (si service défini)
+                # - Courriers qui leur sont affectés (ancien système)
+                # - Courriers qui leur sont affectés (nouveau système v2)
+                # - Courriers qu'ils ont créés
+                from django.db.models import Q
+                filters = Q(enregistre_par=user) | Q(affectations__utilisateur=user) | Q(affectations_v2__destinataire=user)
+                if user.service:
+                    filters |= Q(service_concerne=user.service)
+                queryset = queryset.filter(filters).distinct()
+        
+        return queryset
     
     def perform_create(self, serializer):
         """
         Enregistrer le courrier et assigner automatiquement l'utilisateur connecté.
         Calculer aussi la taille du fichier uploadé.
+        Créer les pièces jointes supplémentaires si fournies.
         """
         courrier = serializer.save(enregistre_par=self.request.user)
-        
-        # Déterminer la taille du fichier
+
+        # Déterminer la taille du fichier principal
         if courrier.fichier:
             courrier.file_size = courrier.fichier.size
             courrier.save()
-    
-    def destroy(self, request, *args, **kwargs):
-        """
-        Archiver (soft delete) un courrier au lieu de le supprimer complètement.
-        URL : DELETE /api/courriers/{id}/
-        """
-        courrier = self.get_object()
-        
-        # Vérifier que l'utilisateur est le créateur ou un admin/RH
-        if courrier.enregistre_par != request.user and request.user.role not in ['admin', 'rh']:
-            return Response(
-                {"error": "Seul le créateur ou un administrateur peut archiver ce courrier"},
-                status=status.HTTP_403_FORBIDDEN
+
+        # Traiter les pièces jointes multiples (fichiers[])
+        fichiers_supplementaires = self.request.FILES.getlist('fichiers')
+        for f in fichiers_supplementaires:
+            ext = f.name.split('.')[-1].lower()
+            if ext == 'pdf':
+                ftype = 'pdf'
+            elif ext in ('jpg', 'jpeg', 'png', 'gif', 'webp'):
+                ftype = 'image'
+            else:
+                ftype = ext
+            CourrierPieceJointe.objects.create(
+                courrier=courrier,
+                fichier=f,
+                nom_fichier=f.name,
+                file_type=ftype,
+                file_size=f.size,
+                uploaded_by=self.request.user,
             )
-        
-        # Archiver le courrier (soft delete)
-        courrier.soft_delete()
-        
-        return Response({
-            "message": "Courrier archivé avec succès"
-        }, status=status.HTTP_204_NO_CONTENT)
-    
+
+        ActionLog.log_action(
+            action_type='courrier_create',
+            utilisateur=self.request.user,
+            description=f"Courrier {courrier.numero_registre} enregistré : {courrier.objet}",
+            courrier=courrier,
+            request=self.request,
+        )
+
+    def perform_update(self, serializer):
+        """Logger la modification d'un courrier."""
+        courrier = serializer.save()
+        ActionLog.log_action(
+            action_type='courrier_update',
+            utilisateur=self.request.user,
+            description=f"Courrier {courrier.numero_registre} modifié : {courrier.objet}",
+            courrier=courrier,
+            request=self.request,
+        )
+
     @action(detail=False, methods=['post'])
     def upload(self, request):
         """
@@ -989,13 +1043,15 @@ class CourrierViewSet(viewsets.ModelViewSet):
         URL : GET /api/courriers/statistiques/
         
         Retourne :
-        - Total de courriers
+        - Total de courriers avec variation %
         - Nombre de courriers entrants/sortants
         - Répartition par statut et service
-        - Courriers urgents
+        - Courriers urgents avec détails
+        - Flux de traitement (lifecycle)
         - Statistiques de versions
         - Tendances mensuelles (6 derniers mois)
         - Statistiques de partage
+        - Charge de travail par service
         """
         from django.db.models import Count, Q
         from django.utils import timezone
@@ -1003,14 +1059,118 @@ class CourrierViewSet(viewsets.ModelViewSet):
         import calendar
         
         queryset = self.get_queryset()
+        now = timezone.now()
         
-        # Statistiques générales
+        # Période actuelle (30 derniers jours)
+        periode_actuelle_debut = now - timedelta(days=30)
+        periode_precedente_debut = now - timedelta(days=60)
+        periode_precedente_fin = periode_actuelle_debut
+        
+        # Courriers période actuelle
+        courriers_actuels = queryset.filter(created_at__gte=periode_actuelle_debut)
+        total_actuel = courriers_actuels.count()
+        
+        # Courriers période précédente (pour comparaison)
+        courriers_precedents = queryset.filter(
+            created_at__gte=periode_precedente_debut,
+            created_at__lt=periode_precedente_fin
+        )
+        total_precedent = courriers_precedents.count()
+        
+        # Calculer variations en %
+        def calculer_variation(actuel, precedent):
+            if precedent == 0:
+                return 100 if actuel > 0 else 0
+            return round(((actuel - precedent) / precedent) * 100, 1)
+        
+        # Statistiques générales avec variations
         stats = {
             'total': queryset.count(),
+            'total_30j': total_actuel,
+            'variation_total': calculer_variation(total_actuel, total_precedent),
+            
             'entrants': queryset.filter(type_courrier='entrant').count(),
+            'entrants_30j': courriers_actuels.filter(type_courrier='entrant').count(),
+            'variation_entrants': calculer_variation(
+                courriers_actuels.filter(type_courrier='entrant').count(),
+                courriers_precedents.filter(type_courrier='entrant').count()
+            ),
+            
             'sortants': queryset.filter(type_courrier='sortant').count(),
+            'sortants_30j': courriers_actuels.filter(type_courrier='sortant').count(),
+            'variation_sortants': calculer_variation(
+                courriers_actuels.filter(type_courrier='sortant').count(),
+                courriers_precedents.filter(type_courrier='sortant').count()
+            ),
+            
             'urgents': queryset.filter(urgent=True).count(),
+            'urgents_30j': courriers_actuels.filter(urgent=True).count(),
+            'variation_urgents': calculer_variation(
+                courriers_actuels.filter(urgent=True).count(),
+                courriers_precedents.filter(urgent=True).count()
+            ),
         }
+        
+        # Flux de traitement (Lifecycle Flow)
+        # On dérive chaque étape depuis les affectations, pas depuis courrier.statut
+        # car ce champ ne contient pas de valeur 'affecte'.
+        from affectations.models import Affectation as AffectationV2
+
+        # IDs de tous les courriers du queryset ayant ≥1 affectation active (non renvoyée/rejetée)
+        ids_avec_affectation_v2 = set(
+            AffectationV2.objects.filter(courrier__in=queryset)
+            .exclude(statut__in=['renvoye', 'rejete'])
+            .values_list('courrier_id', flat=True)
+        )
+        ids_avec_affectation_v1 = set(
+            AffectationCourrier.objects.filter(courrier__in=queryset)
+            .values_list('courrier_id', flat=True)
+        )
+        ids_avec_affectation = ids_avec_affectation_v2 | ids_avec_affectation_v1
+
+        # "En traitement" = courriers avec ≥1 affectation en_traitement
+        ids_en_traitement = set(
+            AffectationV2.objects.filter(courrier__in=queryset, statut='en_traitement')
+            .values_list('courrier_id', flat=True)
+        ) | set(
+            AffectationCourrier.objects.filter(courrier__in=queryset, statut='en_traitement')
+            .values_list('courrier_id', flat=True)
+        )
+
+        nb_enregistres = queryset.exclude(statut='archive').count()
+        nb_affectes    = len(ids_avec_affectation)
+        nb_en_traitement = len(ids_en_traitement)
+        nb_traites     = queryset.filter(statut='traite').count()
+        nb_archives    = queryset.filter(statut='archive').count()
+
+        lifecycle_flow = {
+            'recu': {
+                'label': 'Enregistrés',
+                'count': nb_enregistres,
+                'color': '#dc2626'
+            },
+            'affecte': {
+                'label': 'Affectés',
+                'count': nb_affectes,
+                'color': '#f59e0b'
+            },
+            'en_traitement': {
+                'label': 'En traitement',
+                'count': nb_en_traitement,
+                'color': '#3b82f6'
+            },
+            'traite': {
+                'label': 'Validés',
+                'count': nb_traites,
+                'color': '#10b981'
+            },
+            'archive': {
+                'label': 'Archivés',
+                'count': nb_archives,
+                'color': '#6b7280'
+            }
+        }
+        stats['lifecycle_flow'] = lifecycle_flow
         
         # Répartition par statut
         par_statut = {}
@@ -1022,16 +1182,77 @@ class CourrierViewSet(viewsets.ModelViewSet):
             }
         stats['par_statut'] = par_statut
         
-        # Répartition par service (seulement ceux qui ont des courriers)
+        # Répartition par service avec charge de travail
         par_service = {}
+        total_courriers_services = queryset.exclude(service_concerne='').count()
         for service_key, service_label in Courrier.SERVICE_CHOICES:
-            count = queryset.filter(service_concerne=service_key).count()
-            if count > 0:
-                par_service[service_key] = {
-                    'label': service_label,
-                    'count': count
-                }
+            if service_key:  # Ignorer les valeurs vides
+                count = queryset.filter(service_concerne=service_key).count()
+                en_traitement = queryset.filter(
+                    service_concerne=service_key,
+                    statut__in=['recu', 'affecte', 'en_traitement']
+                ).count()
+                if count > 0:
+                    pourcentage = round((count / total_courriers_services * 100), 1) if total_courriers_services > 0 else 0
+                    par_service[service_key] = {
+                        'label': service_label,
+                        'count': count,
+                        'en_traitement': en_traitement,
+                        'pourcentage': pourcentage
+                    }
         stats['par_service'] = par_service
+        
+        # Distribution par type (pour le graphique en camembert)
+        distribution_types = [
+            {
+                'name': 'Entrants',
+                'value': stats['entrants'],
+                'percentage': round((stats['entrants'] / stats['total'] * 100), 1) if stats['total'] > 0 else 0
+            },
+            {
+                'name': 'Sortants',
+                'value': stats['sortants'],
+                'percentage': round((stats['sortants'] / stats['total'] * 100), 1) if stats['total'] > 0 else 0
+            },
+        ]
+        # Ajouter internes si > 0
+        count_internes = queryset.filter(type_courrier='interne').count()
+        if count_internes > 0:
+            distribution_types.append({
+                'name': 'Internes',
+                'value': count_internes,
+                'percentage': round((count_internes / stats['total'] * 100), 1) if stats['total'] > 0 else 0
+            })
+        stats['distribution_types'] = distribution_types
+        
+        # Courriers urgents avec détails complets
+        courriers_urgents = queryset.filter(urgent=True).exclude(
+            statut__in=['traite', 'archive']
+        ).order_by('-created_at')[:5]
+        
+        urgents_details = []
+        for courrier in courriers_urgents:
+            # Calculer le temps écoulé
+            temps_ecoule = now - courrier.created_at
+            if temps_ecoule.days > 0:
+                temps_str = f"{temps_ecoule.days}j"
+            else:
+                heures = temps_ecoule.seconds // 3600
+                temps_str = f"{heures}h"
+            
+            urgents_details.append({
+                'id': courrier.id,
+                'numero_registre': courrier.numero_registre,
+                'objet': courrier.objet[:100] if courrier.objet else 'Sans objet',
+                'expediteur': courrier.expediteur if hasattr(courrier, 'expediteur') else '',
+                'service': dict(Courrier.SERVICE_CHOICES).get(courrier.service_concerne, 'Non défini'),
+                'service_key': courrier.service_concerne,
+                'statut': courrier.get_statut_display(),
+                'statut_key': courrier.statut,
+                'temps_ecoule': temps_str,
+                'created_at': courrier.created_at.isoformat()
+            })
+        stats['urgents_details'] = urgents_details
         
         # Statistiques de versions
         courriers_avec_versions = queryset.filter(
@@ -1041,7 +1262,6 @@ class CourrierViewSet(viewsets.ModelViewSet):
         stats['total_versions'] = queryset.filter(courrier_parent__isnull=False).count()
         
         # Tendances mensuelles (6 derniers mois)
-        now = timezone.now()
         tendances = []
         for i in range(5, -1, -1):
             # Calculer le premier et dernier jour du mois
@@ -1057,16 +1277,15 @@ class CourrierViewSet(viewsets.ModelViewSet):
             last_day = calendar.monthrange(target_year, target_month)[1]
             end_date = timezone.datetime(target_year, target_month, last_day, 23, 59, 59, tzinfo=now.tzinfo)
             
-            # Compter les courriers du mois selon leur date réelle (réception/envoi)
-            # Pour les entrants: utiliser date_reception, pour les sortants: date_envoi
+            # Compter les courriers du mois
             count_entrants = queryset.filter(
-                date_reception__gte=start_date,
-                date_reception__lte=end_date,
+                created_at__gte=start_date,
+                created_at__lte=end_date,
                 type_courrier='entrant'
             ).count()
             count_sortants = queryset.filter(
-                date_envoi__gte=start_date,
-                date_envoi__lte=end_date,
+                created_at__gte=start_date,
+                created_at__lte=end_date,
                 type_courrier='sortant'
             ).count()
             count_total = count_entrants + count_sortants
@@ -1076,6 +1295,7 @@ class CourrierViewSet(viewsets.ModelViewSet):
             
             tendances.append({
                 'mois': f"{mois_noms[target_month]} {target_year}",
+                'count': count_total,
                 'total': count_total,
                 'entrants': count_entrants,
                 'sortants': count_sortants
@@ -1099,16 +1319,424 @@ class CourrierViewSet(viewsets.ModelViewSet):
         except:
             pass
         
+        # ========================================
+        # Format adapté pour le nouveau design dashboard
+        # ========================================
+        
+        # 1. KPIs (4 cards) - format design
+        recus_aujourdhui = queryset.filter(created_at__date=now.date()).count()
+        recus_hier = queryset.filter(created_at__date=(now - timedelta(days=1)).date()).count()
+        en_attente = queryset.filter(statut__in=['recu', 'affecte', 'en_traitement']).count()
+        en_attente_avant = courriers_precedents.filter(statut__in=['recu', 'affecte', 'en_traitement']).count()
+
+        # Urgents = affectations v2 avec niveau_urgence critique ou élevé, non terminées
+        # (même source que urgentItems, donc les deux chiffres seront cohérents)
+        from affectations.models import Affectation as _AffV2
+        nb_urgents = _AffV2.objects.filter(
+            niveau_urgence__in=['critique', 'eleve']
+        ).exclude(
+            statut__in=['valide', 'signe', 'rejete', 'renvoye']
+        ).values('courrier_id').distinct().count()
+
+        stats['kpis'] = [
+            {
+                'label': 'Total courriers',
+                'value': f"{total_actuel:,}".replace(',', ' '),
+                'change': f"{'+' if stats['variation_total'] >= 0 else ''}{stats['variation_total']}%",
+                'positive': stats['variation_total'] >= 0,
+                'color': 'bg-sky-50/80 border-sky-100'
+            },
+            {
+                'label': 'Reçus aujourd\'hui',
+                'value': str(recus_aujourdhui),
+                'change': f"+{round(((recus_aujourdhui - recus_hier) / recus_hier * 100) if recus_hier > 0 else 0)}%",
+                'positive': True,
+                'color': 'bg-sky-50/80 border-sky-100'
+            },
+            {
+                'label': 'En attente',
+                'value': str(en_attente),
+                'change': f"{'+' if calculer_variation(en_attente, en_attente_avant) >= 0 else ''}{calculer_variation(en_attente, en_attente_avant)}%",
+                'positive': calculer_variation(en_attente, en_attente_avant) <= 0,
+                'color': 'bg-amber-50/80 border-amber-100'
+            },
+            {
+                'label': 'Urgents',
+                'value': str(nb_urgents),
+                'change': 'Élevé' if nb_urgents > 10 else ('Moyen' if nb_urgents > 0 else 'Normal'),
+                'positive': False,
+                'color': 'bg-red-50/80 border-red-100'
+            }
+        ]
+        
+        # 2. Lifecycle - format array (design)
+        stats['lifecycle'] = [
+            {
+                'label': lifecycle_flow['recu']['label'],
+                'count': lifecycle_flow['recu']['count'],
+                'color': lifecycle_flow['recu']['color']
+            },
+            {
+                'label': lifecycle_flow['affecte']['label'],
+                'count': lifecycle_flow['affecte']['count'],
+                'color': '#38bdf8'  # sky-400
+            },
+            {
+                'label': lifecycle_flow['en_traitement']['label'],
+                'count': lifecycle_flow['en_traitement']['count'],
+                'color': '#1d4ed8'  # blue-700
+            },
+            {
+                'label': lifecycle_flow['traite']['label'],
+                'count': lifecycle_flow['traite']['count'],
+                'color': lifecycle_flow['traite']['color']
+            },
+            {
+                'label': lifecycle_flow['archive']['label'],
+                'count': lifecycle_flow['archive']['count'],
+                'color': lifecycle_flow['archive']['color']
+            }
+        ]
+        
+        # 3. Distribution par type - format design avec percentages
+        stats['distribution'] = []
+        total_types = stats['total'] if stats['total'] > 0 else 1
+        
+        # Utiliser les catégories de courrier si disponibles
+        try:
+            from .models import CategorieCourrier
+            categories = CategorieCourrier.objects.all()[:3]
+            if categories.exists():
+                colors = ['#800020', '#505f76', '#c3c6d6']
+                for idx, cat in enumerate(categories):
+                    count = queryset.filter(categorie=cat).count()
+                    percent = round((count / total_types * 100), 0)
+                    stats['distribution'].append({
+                        'name': cat.nom,
+                        'percent': int(percent),
+                        'color': colors[idx] if idx < len(colors) else '#94a3b8'
+                    })
+            else:
+                # Fallback: utiliser les types de courrier
+                stats['distribution'] = [
+                    {
+                        'name': 'Entrants',
+                        'percent': round((stats['entrants'] / total_types * 100), 0),
+                        'color': '#800020'
+                    },
+                    {
+                        'name': 'Sortants',
+                        'percent': round((stats['sortants'] / total_types * 100), 0),
+                        'color': '#505f76'
+                    },
+                    {
+                        'name': 'Internes',
+                        'percent': round((count_internes / total_types * 100), 0),
+                        'color': '#c3c6d6'
+                    }
+                ]
+        except:
+            stats['distribution'] = [
+                {
+                    'name': 'Entrants',
+                    'percent': round((stats['entrants'] / total_types * 100), 0),
+                    'color': '#800020'
+                },
+                {
+                    'name': 'Sortants',
+                    'percent': round((stats['sortants'] / total_types * 100), 0),
+                    'color': '#505f76'
+                },
+                {
+                    'name': 'Internes',
+                    'percent': round((count_internes / total_types * 100), 0),
+                    'color': '#c3c6d6'
+                }
+            ]
+        
+        # 4. urgent Items - format design (basé sur affectations critiques)
+        from affectations.models import Affectation
+        
+        # Combiner affectations de l'ancien et nouveau système
+        # Ancien système : AffectationCourrier avec niveau_urgence='critique'
+        affectations_critiques_old = AffectationCourrier.objects.filter(
+            niveau_urgence='critique'
+        ).exclude(
+            statut__in=['valide', 'signe']  # Exclure les affectations déjà traitées/signées
+        ).select_related('courrier', 'utilisateur').order_by('-date_affectation')
+        
+        # Nouveau système : Affectation v2 avec niveau_urgence='critique' ou 'eleve'
+        affectations_critiques_v2 = Affectation.objects.filter(
+            niveau_urgence__in=['critique', 'eleve']
+        ).exclude(
+            statut__in=['valide', 'signe']  # Exclure les affectations déjà traitées/signées
+        ).select_related('courrier', 'destinataire', 'service').order_by('-date_affectation')
+        
+        stats['urgentItems'] = []
+        
+        # Ajouter affectations de l'ancien système
+        for affectation in affectations_critiques_old:
+            # Calculer le temps écoulé depuis l'affectation
+            temps_ecoule = now - affectation.date_affectation
+            if temps_ecoule.days > 0:
+                temps_str = f"{temps_ecoule.days}j"
+            else:
+                heures = temps_ecoule.seconds // 3600
+                temps_str = f"{heures}h"
+            
+            # Créer le subtitle avec le statut et l'utilisateur
+            subtitle = f"Affecté à {affectation.utilisateur.get_full_name() or affectation.utilisateur.username} · {temps_str}"
+            
+            stats['urgentItems'].append({
+                'id': affectation.courrier.id,
+                'affectation_id': affectation.id,
+                'title': affectation.courrier.objet[:60] if affectation.courrier.objet else 'Sans objet',
+                'subtitle': subtitle,
+                'department': dict(Courrier.SERVICE_CHOICES).get(affectation.courrier.service_concerne, 'Non défini'),
+                'numero_registre': affectation.courrier.numero_registre,
+                'statut_affectation': affectation.get_statut_display(),
+                'niveau_urgence': affectation.get_niveau_urgence_display(),
+                'status': 'critique'
+            })
+        
+        # Ajouter affectations du nouveau système v2
+        for affectation in affectations_critiques_v2:
+            # Calculer le temps écoulé depuis l'affectation
+            temps_ecoule = now - affectation.date_affectation
+            if temps_ecoule.days > 0:
+                temps_str = f"{temps_ecoule.days}j"
+            else:
+                heures = temps_ecoule.seconds // 3600
+                temps_str = f"{heures}h"
+            
+            # Créer le subtitle avec le statut et l'utilisateur
+            subtitle = f"Affecté à {affectation.destinataire.get_full_name() or affectation.destinataire.username} · {temps_str}"
+            
+            # Déterminer le service (utiliser affectation.service si disponible, sinon service du courrier)
+            if affectation.service:
+                department = affectation.service.nom
+            else:
+                department = dict(Courrier.SERVICE_CHOICES).get(affectation.courrier.service_concerne, 'Non défini')
+            
+            stats['urgentItems'].append({
+                'id': affectation.courrier.id,
+                'affectation_id': affectation.id,
+                'title': affectation.courrier.objet[:60] if affectation.courrier.objet else 'Sans objet',
+                'subtitle': subtitle,
+                'department': department,
+                'numero_registre': affectation.courrier.numero_registre,
+                'statut_affectation': affectation.get_statut_display(),
+                'niveau_urgence': affectation.get_niveau_urgence_display(),
+                'status': 'critique' if affectation.niveau_urgence == 'critique' else 'urgent'
+            })
+        
+        # Limiter à 10 items et trier par date décroissante
+        stats['urgentItems'] = sorted(stats['urgentItems'], key=lambda x: x.get('affectation_id', 0), reverse=True)[:10]
+        
+        # 5. Recent Mails - format design
+        courriers_recents = queryset.order_by('-created_at')[:3]
+        stats['recentMails'] = []
+        
+        icon_map = {
+            'entrant': 'Inbox',
+            'sortant': 'Send',
+            'interne': 'Mail'
+        }
+        
+        icon_color_map = {
+            'entrant': 'bg-blue-50 text-blue-600',
+            'sortant': 'bg-emerald-50 text-emerald-600',
+            'interne': 'bg-purple-50 text-purple-600'
+        }
+        
+        status_map = {
+            'recu': 'pending',
+            'affecte': 'pending',
+            'en_traitement': 'in_progress',
+            'traite': 'completed',
+            'archive': 'completed'
+        }
+        
+        for courrier in courriers_recents:
+            # Format date relative
+            diff = now - courrier.created_at
+            if diff.days == 0:
+                received_str = courrier.created_at.strftime('%H:%M')
+            elif diff.days == 1:
+                received_str = "Hier, " + courrier.created_at.strftime('%H:%M')
+            else:
+                received_str = courrier.created_at.strftime('%d %b, %H:%M')
+            
+            # Déterminer si urgent
+            mail_status = status_map.get(courrier.statut, 'pending')
+            if courrier.urgent:
+                mail_status = 'urgent'
+                
+            stats['recentMails'].append({
+                'id': courrier.id,
+                'subject': courrier.objet[:60] if courrier.objet else 'Sans objet',
+                'sender': courrier.expediteur if courrier.type_courrier == 'entrant' else courrier.destinataire,
+                'received': received_str,
+                'department': courrier.categorie.name if courrier.categorie else courrier.get_type_courrier_display(),
+                'status': mail_status,
+                'icon': icon_map.get(courrier.type_courrier, 'Mail'),
+                'iconColor': icon_color_map.get(courrier.type_courrier, 'bg-slate-50 text-slate-600')
+            })
+        
+        # 6. Service Workload - format design
+        # Combiner la charge de travail des courriers (service_concerne) et des affectations v2 (service)
+        from collections import defaultdict
+        
+        # Charge basée sur service_concerne du courrier
+        charge_par_service = defaultdict(lambda: {'count': 0, 'label': '', 'en_traitement': 0})
+        
+        for service_key, service_label in Courrier.SERVICE_CHOICES:
+            if service_key:  # Ignorer les valeurs vides
+                count = queryset.filter(service_concerne=service_key).count()
+                en_traitement = queryset.filter(
+                    service_concerne=service_key,
+                    statut__in=['recu', 'affecte', 'en_traitement']
+                ).count()
+                if count > 0:
+                    charge_par_service[service_key] = {
+                        'count': count,
+                        'label': service_label,
+                        'en_traitement': en_traitement
+                    }
+        
+        # Ajouter la charge basée sur les affectations v2 en cours
+        from users.models import Service
+        affectations_actives_v2 = Affectation.objects.exclude(
+            statut__in=['valide', 'signe', 'rejete', 'renvoye']
+        ).select_related('service')
+        
+        for affectation in affectations_actives_v2:
+            if affectation.service:
+                service_nom = affectation.service.nom
+                # Ajouter à la charge du service
+                if service_nom not in charge_par_service:
+                    charge_par_service[service_nom] = {
+                        'count': 0,
+                        'label': service_nom,
+                        'en_traitement': 0
+                    }
+                charge_par_service[service_nom]['count'] += 1
+                charge_par_service[service_nom]['en_traitement'] += 1
+        
+        # Calculer les pourcentages
+        total_courriers_services = sum(s['count'] for s in charge_par_service.values())
+        
+        stats['serviceWorkload'] = []
+        colors = ['bg-[#800020]', 'bg-emerald-500', 'bg-amber-500', 'bg-slate-500']
+        
+        # Trier par count décroissant et prendre top 4
+        services_sorted = sorted(
+            [(key, data) for key, data in charge_par_service.items()],
+            key=lambda x: x[1]['count'],
+            reverse=True
+        )[:4]
+        
+        for idx, (key, service_data) in enumerate(services_sorted):
+            pourcentage = round((service_data['count'] / total_courriers_services * 100), 1) if total_courriers_services > 0 else 0
+            stats['serviceWorkload'].append({
+                'name': service_data['label'],
+                'percent': int(pourcentage),
+                'color': colors[idx] if idx < len(colors) else 'bg-slate-400'
+            })
+        
+        # 7. Weekly Trend - 7 derniers jours
+        stats['weeklyTrend'] = []
+        jours_fr = ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam', 'Dim']
+        
+        for i in range(6, -1, -1):  # 7 jours en arrière
+            date_jour = (now - timedelta(days=i)).date()
+            count_jour = queryset.filter(created_at__date=date_jour).count()
+            
+            # Calculer le % relatif (max = 100%)
+            jour_semaine_idx = date_jour.weekday()  # 0=Lundi, 6=Dimanche
+            
+            stats['weeklyTrend'].append({
+                'day': jours_fr[jour_semaine_idx],
+                'value': count_jour
+            })
+        
+        # Normaliser les valeurs de weeklyTrend en pourcentages (0-100)
+        max_val = max([t['value'] for t in stats['weeklyTrend']]) if stats['weeklyTrend'] else 1
+        if max_val > 0:
+            for trend in stats['weeklyTrend']:
+                trend['value'] = round((trend['value'] / max_val) * 100)
+        
         return Response(stats)
+    
+    @action(detail=False, methods=['get'], url_path='search-courriers')
+    def search_courriers(self, request):
+        """
+        Rechercher des courriers pour la liste déroulante.
+        URL : GET /api/courriers/search-courriers/?q=texte&type=entrant
+        
+        Paramètres optionnels:
+        - q : texte de recherche (numero_registre, objet, expediteur, destinataire)
+        - type : filtrer par type de courrier (entrant, sortant, interne)
+        - exclude : ID de courrier à exclure (utile pour éviter auto-référence)
+        
+        Retourne une liste simplifiée de courriers avec :
+        - id, numero_registre, objet, type_courrier, type_courrier_display, date_principale
+        
+        Limité à 50 résultats max pour les performances.
+        """
+        from django.db.models import Q
+        
+        queryset = self.get_queryset()
+        
+        # Recherche par texte
+        q = request.query_params.get('q', '').strip()
+        if q:
+            queryset = queryset.filter(
+                Q(numero_registre__icontains=q) |
+                Q(objet__icontains=q) |
+                Q(expediteur__icontains=q) |
+                Q(destinataire__icontains=q) |
+                Q(reference__icontains=q) |
+                Q(reference_structure__icontains=q)
+            )
+        
+        # Filtrer par type
+        type_courrier = request.query_params.get('type', '').strip()
+        if type_courrier in ['entrant', 'sortant', 'interne']:
+            queryset = queryset.filter(type_courrier=type_courrier)
+        
+        # Exclure un courrier spécifique (pour éviter auto-référence)
+        exclude_id = request.query_params.get('exclude', '').strip()
+        if exclude_id and exclude_id.isdigit():
+            queryset = queryset.exclude(id=int(exclude_id))
+        
+        # Limiter à 50 résultats et trier par date décroissante
+        courriers = queryset.order_by('-created_at')[:50]
+        
+        # Construire la réponse simplifiée
+        results = []
+        for courrier in courriers:
+            results.append({
+                'id': courrier.id,
+                'numero_registre': courrier.numero_registre,
+                'objet': courrier.objet,
+                'type_courrier': courrier.type_courrier,
+                'type_courrier_display': courrier.get_type_courrier_display(),
+                'date_principale': courrier.get_date_principale().isoformat() if courrier.get_date_principale() else None,
+                'expediteur': courrier.expediteur,
+                'destinataire': courrier.destinataire,
+            })
+        
+        return Response(results)
     
     @action(detail=False, methods=['get'])
     def export_excel(self, request):
         """
         Exporter le registre de courrier au format Excel.
         URL : GET /api/courriers/export_excel/
+        Paramètre optionnel : fields=numero_registre,type_courrier,...
         
-        Génère un fichier Excel avec toutes les informations des courriers filtrés.
-        Le nom du fichier contient la date et l'heure d'export.
+        Génère un fichier Excel avec les colonnes sélectionnées.
         """
         import openpyxl
         from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
@@ -1117,7 +1745,55 @@ class CourrierViewSet(viewsets.ModelViewSet):
         
         # Appliquer les filtres de la requête
         queryset = self.filter_queryset(self.get_queryset())
-        
+
+        # Filtres supplémentaires non couverts par filter_queryset
+        concerne = request.query_params.get('concerne', '').strip()
+        expediteur = request.query_params.get('expediteur', '').strip()
+        destinataire = request.query_params.get('destinataire', '').strip()
+        if concerne:
+            queryset = queryset.filter(
+                Q(expediteur__icontains=concerne) | Q(destinataire__icontains=concerne)
+            )
+        if expediteur:
+            queryset = queryset.filter(expediteur__icontains=expediteur)
+        if destinataire:
+            queryset = queryset.filter(destinataire__icontains=destinataire)
+
+        # Définition de toutes les colonnes disponibles : clé → (label, getter)
+        ALL_COLUMNS = [
+            ('numero_registre',  "N° Registre",           lambda c: c.numero_registre),
+            ('type_courrier',    "Type",                   lambda c: c.get_type_courrier_display()),
+            ('date_reception',   "Date Réception",         lambda c: c.date_reception.strftime('%d/%m/%Y') if c.date_reception else ''),
+            ('mode_reception',   "Mode de réception",      lambda c: c.get_mode_reception_display() if c.mode_reception else ''),
+            ('date_envoi',       "Date Envoi",             lambda c: c.date_envoi.strftime('%d/%m/%Y') if c.date_envoi else ''),
+            ('mode_envoi',       "Mode d'envoi",           lambda c: c.get_mode_envoi_display() if c.mode_envoi else ''),
+            ('expediteur',       "Expéditeur",             lambda c: c.expediteur),
+            ('destinataire',     "Destinataire",           lambda c: c.destinataire),
+            ('objet',            "Objet",                  lambda c: c.objet),
+            ('reference',        "Référence",              lambda c: c.reference),
+            ('categorie',        "Catégorie",              lambda c: c.categorie.nom if c.categorie else ''),
+            ('service_concerne', "Service Concerné",       lambda c: c.get_service_concerne_display() if c.service_concerne else ''),
+            ('statut',           "Statut",                 lambda c: c.get_statut_display()),
+            ('urgent',           "Urgent",                 lambda c: 'Oui' if c.urgent else 'Non'),
+            ('notes',            "Notes",                  lambda c: c.notes),
+            ('enregistre_par',   "Enregistré par",         lambda c: c.enregistre_par.username if c.enregistre_par else ''),
+            ('created_at',       "Date d'enregistrement",  lambda c: c.created_at.strftime('%d/%m/%Y %H:%M')),
+        ]
+
+        # Filtrer les colonnes selon le param ?fields= (si fourni)
+        requested = request.query_params.get('fields', '')
+        if requested:
+            requested_keys = [f.strip() for f in requested.split(',') if f.strip()]
+            key_order = {k: i for i, k in enumerate(requested_keys)}
+            columns = [col for col in ALL_COLUMNS if col[0] in requested_keys]
+            columns.sort(key=lambda col: key_order.get(col[0], 999))
+        else:
+            # Par défaut : toutes les colonnes sauf mode_reception, mode_envoi, categorie, urgent
+            default_keys = {'numero_registre','type_courrier','date_reception','date_envoi',
+                            'expediteur','destinataire','objet','reference',
+                            'service_concerne','statut','notes','enregistre_par','created_at'}
+            columns = [col for col in ALL_COLUMNS if col[0] in default_keys]
+
         # Créer le workbook Excel
         wb = openpyxl.Workbook()
         ws = wb.active
@@ -1127,35 +1803,14 @@ class CourrierViewSet(viewsets.ModelViewSet):
         header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
         header_font = Font(bold=True, color="FFFFFF", size=11)
         header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        
-        # Style pour les bordures
         thin_border = Border(
-            left=Side(style='thin'),
-            right=Side(style='thin'),
-            top=Side(style='thin'),
-            bottom=Side(style='thin')
+            left=Side(style='thin'), right=Side(style='thin'),
+            top=Side(style='thin'),  bottom=Side(style='thin')
         )
         
-        # Définir les en-têtes des colonnes
-        headers = [
-            "N° Registre",
-            "Type",
-            "Date Réception",
-            "Date Envoi",
-            "Expéditeur",
-            "Destinataire",
-            "Objet",
-            "Référence",
-            "Service Concerné",
-            "Statut",
-            "Notes",
-            "Enregistré par",
-            "Date d'enregistrement"
-        ]
-        
         # Écrire les en-têtes
-        for col_num, header in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=col_num, value=header)
+        for col_num, (_, label, _getter) in enumerate(columns, 1):
+            cell = ws.cell(row=1, column=col_num, value=label)
             cell.fill = header_fill
             cell.font = header_font
             cell.alignment = header_alignment
@@ -1163,49 +1818,12 @@ class CourrierViewSet(viewsets.ModelViewSet):
         
         # Écrire les données
         for row_num, courrier in enumerate(queryset, 2):
-            # Colonne 1 : Numéro de registre
-            ws.cell(row=row_num, column=1, value=courrier.numero_registre).border = thin_border
-            
-            # Colonne 2 : Type
-            ws.cell(row=row_num, column=2, value=courrier.get_type_courrier_display()).border = thin_border
-            
-            # Colonne 3 : Date de réception
-            date_reception = courrier.date_reception.strftime('%d/%m/%Y') if courrier.date_reception else ''
-            ws.cell(row=row_num, column=3, value=date_reception).border = thin_border
-            
-            # Colonne 4 : Date d'envoi
-            date_envoi = courrier.date_envoi.strftime('%d/%m/%Y') if courrier.date_envoi else ''
-            ws.cell(row=row_num, column=4, value=date_envoi).border = thin_border
-            
-            # Colonne 5 : Expéditeur
-            ws.cell(row=row_num, column=5, value=courrier.expediteur).border = thin_border
-            
-            # Colonne 6 : Destinataire
-            ws.cell(row=row_num, column=6, value=courrier.destinataire).border = thin_border
-            
-            # Colonne 7 : Objet
-            ws.cell(row=row_num, column=7, value=courrier.objet).border = thin_border
-            
-            # Colonne 8 : Référence
-            ws.cell(row=row_num, column=8, value=courrier.reference).border = thin_border
-            
-            # Colonne 9 : Service concerné
-            service = courrier.get_service_concerne_display() if courrier.service_concerne else ''
-            ws.cell(row=row_num, column=9, value=service).border = thin_border
-            
-            # Colonne 10 : Statut
-            ws.cell(row=row_num, column=10, value=courrier.get_statut_display()).border = thin_border
-            
-            # Colonne 11 : Notes
-            ws.cell(row=row_num, column=11, value=courrier.notes).border = thin_border
-            
-            # Colonne 12 : Enregistré par
-            enregistre_par = courrier.enregistre_par.username if courrier.enregistre_par else ''
-            ws.cell(row=row_num, column=12, value=enregistre_par).border = thin_border
-            
-            # Colonne 13 : Date d'enregistrement
-            created_at = courrier.created_at.strftime('%d/%m/%Y %H:%M')
-            ws.cell(row=row_num, column=13, value=created_at).border = thin_border
+            for col_num, (_key, _label, getter) in enumerate(columns, 1):
+                try:
+                    value = getter(courrier)
+                except Exception:
+                    value = ''
+                ws.cell(row=row_num, column=col_num, value=value).border = thin_border
         
         # Ajuster automatiquement la largeur des colonnes
         for col in ws.columns:
@@ -1415,92 +2033,120 @@ class CourrierViewSet(viewsets.ModelViewSet):
     def affecter_service(self, request, pk=None):
         """
         Affecter un courrier à tous les utilisateurs d'un service.
+        Crée un Circuit simultané + une Affectation par utilisateur du service
+        (table affectations.Affectation — seule table d'affectation de référence).
+
         URL : POST /api/courriers/{id}/affecter_service/
-        
         Body JSON :
         {
             "service_id": 1,
-            "note": "Traitement urgent requis"
+            "note": "...",
+            "niveau_urgence": "normal|faible|eleve|critique",
+            "date_echeance": "2026-03-20",
+            "action_requise": "informatif|a_signer|..."
         }
         """
+        from affectations.models import Circuit, Affectation
+        from users.models import Notification
+
         try:
             courrier = self.get_object()
             service_id = request.data.get('service_id')
             note = request.data.get('note', '')
-            
+            niveau_urgence = request.data.get('niveau_urgence', 'normal')
+            date_echeance = request.data.get('date_echeance') or None
+            action_requise = request.data.get('action_requise', 'informatif')
+
             if not service_id:
                 return Response(
-                    {'error': 'service_id est requis'}, 
+                    {'error': 'service_id est requis'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-            
+
             try:
                 service = Service.objects.get(id=service_id)
             except Service.DoesNotExist:
                 return Response(
-                    {'error': 'Service introuvable'}, 
+                    {'error': 'Service introuvable'},
                     status=status.HTTP_404_NOT_FOUND
                 )
-            
-            # Récupérer tous les utilisateurs du service
-            utilisateurs_service = User.objects.filter(service=service)
-            
+
+            # Récupérer les utilisateurs actifs du service
+            utilisateurs_service = User.objects.filter(service=service, is_active=True)
+
             if not utilisateurs_service.exists():
                 return Response(
-                    {'error': 'Aucun utilisateur trouvé dans ce service'}, 
+                    {'error': f'Aucun utilisateur actif trouvé dans le service {service.nom}'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-            
-            # Créer les affectations pour tous les utilisateurs du service
+
+            # Créer un circuit simultané pour ce courrier
+            circuit = Circuit.objects.create(
+                courrier=courrier,
+                type_circuit='simultane',
+                titre=f'Affectation au service {service.nom}',
+                cree_par=request.user,
+            )
+
+            # Créer une affectation par utilisateur du service
             affectations_creees = []
-            affectations_existantes = 0
-            
             for utilisateur in utilisateurs_service:
-                # Vérifier si l'affectation n'existe pas déjà
-                if not AffectationCourrier.objects.filter(
-                    courrier=courrier, 
-                    utilisateur=utilisateur
-                ).exists():
-                    affectation = AffectationCourrier.objects.create(
-                        courrier=courrier,
-                        utilisateur=utilisateur,
-                        affecte_par=request.user,
-                        note=note
-                    )
-                    affectations_creees.append(affectation)
-                    
-                    # Créer une notification pour cet utilisateur
-                    from users.utils import creer_notification
-                    creer_notification(
-                        utilisateur=utilisateur,
-                        type_notif='courrier_affecte',
-                        titre=f'Nouveau courrier affecté: {courrier.numero_registre}',
-                        message=f'Le courrier "{courrier.objet}" vous a été affecté pour traitement.',
-                        courrier_id=courrier.id,
-                    )
-                else:
-                    affectations_existantes += 1
-            
-            # Mettre à jour le courrier (statut et service concerné)
+                affectation = Affectation.objects.create(
+                    circuit=circuit,
+                    courrier=courrier,
+                    destinataire=utilisateur,
+                    service=service,
+                    affecte_par=request.user,
+                    action_requise=action_requise,
+                    niveau_urgence=niveau_urgence,
+                    date_echeance=date_echeance,
+                    note_instruction=note,
+                    etape_numero=1,
+                    statut='distribue',
+                )
+                affectations_creees.append(affectation)
+
+                # Notification
+                Notification.objects.create(
+                    utilisateur=utilisateur,
+                    type='courrier_affecte',
+                    titre=f'Nouveau courrier affecté : {courrier.numero_registre}',
+                    message=(
+                        f'Le courrier "{courrier.objet}" a été affecté à votre service '
+                        f'({service.nom}). Action requise : {affectation.get_action_requise_display()}'
+                    ),
+                    courrier_id=courrier.id,
+                )
+
+            # Mettre à jour le statut et le service du courrier
             if courrier.statut == 'recu':
                 courrier.statut = 'en_traitement'
-            
-            # Mettre à jour le service concerné en utilisant la méthode du modèle
             service_code = Courrier.get_service_code_from_name(service.nom)
             courrier.service_concerne = service_code
             courrier.save()
-            
+
+            ActionLog.log_action(
+                action_type='affectation_create',
+                utilisateur=request.user,
+                description=(
+                    f"Courrier {courrier.numero_registre} affecté au service {service.nom} "
+                    f"via circuit #{circuit.id} ({len(affectations_creees)} affectation(s))"
+                ),
+                courrier=courrier,
+                request=request,
+            )
+
             return Response({
                 'message': f'Courrier affecté à {len(affectations_creees)} utilisateur(s) du service {service.nom}',
+                'circuit_id': circuit.id,
                 'service_nom': service.nom,
                 'service_code': service_code,
                 'utilisateurs_affectes': len(affectations_creees),
-                'affectations_existantes': affectations_existantes,
                 'courrier_numero': courrier.numero_registre,
                 'courrier_statut': courrier.statut,
-                'courrier_service_concerne': courrier.service_concerne
+                'courrier_service_concerne': courrier.service_concerne,
             }, status=status.HTTP_201_CREATED)
-            
+
         except Exception as e:
             return Response(
                 {'error': str(e)}, 
@@ -1525,21 +2171,25 @@ class CourrierViewSet(viewsets.ModelViewSet):
         """
         Récupérer les courriers affectés à l'utilisateur connecté.
         URL : GET /api/courriers/mes_courriers/
-        
-        Permet aux utilisateurs normaux de voir seulement les courriers qui leur sont affectés.
+
+        Utilise uniquement affectations.Affectation (table de référence).
         """
-        # Récupérer les IDs des courriers affectés à cet utilisateur
-        courriers_affectes_ids = AffectationCourrier.objects.filter(
-            utilisateur=request.user
-        ).values_list('courrier_id', flat=True)
-        
+        from django.db.models import Q
+        from affectations.models import Affectation
+
+        # IDs des courriers affectés au user (nouveau système, seule source de vérité)
+        courriers_ids = set(
+            Affectation.objects
+            .filter(destinataire=request.user)
+            .exclude(statut='renvoye')
+            .values_list('courrier_id', flat=True)
+        )
+
         # Récupérer les courriers correspondants
-        courriers = Courrier.objects.filter(
-            id__in=courriers_affectes_ids
-        ).order_by('-created_at')
-        
-        # Appliquer les filtres de recherche si fournis
-        search = request.query_params.get('search', None)
+        courriers = Courrier.objects.filter(id__in=courriers_ids).order_by('-created_at')
+
+        # Filtres optionnels
+        search = request.query_params.get('search')
         if search:
             courriers = courriers.filter(
                 Q(numero_registre__icontains=search) |
@@ -1547,12 +2197,11 @@ class CourrierViewSet(viewsets.ModelViewSet):
                 Q(expediteur__icontains=search) |
                 Q(destinataire__icontains=search)
             )
-        
-        # Appliquer l'ordre si fourni
-        ordering = request.query_params.get('ordering', None)
+
+        ordering = request.query_params.get('ordering')
         if ordering:
             courriers = courriers.order_by(ordering)
-        
+
         serializer = CourrierSerializer(courriers, many=True)
         return Response(serializer.data)
     
@@ -1565,7 +2214,13 @@ class CourrierViewSet(viewsets.ModelViewSet):
         
         # Archiver le courrier (soft delete)
         courrier.soft_delete(request.user)
-        
+        ActionLog.log_action(
+            action_type='courrier_archive',
+            utilisateur=request.user,
+            description=f"Courrier {courrier.numero_registre} archivé : {courrier.objet}",
+            courrier=courrier,
+            request=request,
+        )
         return Response({
             "message": "Courrier archivé avec succès"
         }, status=status.HTTP_204_NO_CONTENT)
@@ -1626,7 +2281,13 @@ class CourrierViewSet(viewsets.ModelViewSet):
         
         # Restaurer le courrier
         courrier.restore()
-        
+        ActionLog.log_action(
+            action_type='courrier_restore',
+            utilisateur=request.user,
+            description=f"Courrier {courrier.numero_registre} restauré depuis les archives.",
+            courrier=courrier,
+            request=request,
+        )
         serializer = self.get_serializer(courrier)
         return Response({
             "message": "Courrier restauré avec succès",
@@ -1703,6 +2364,56 @@ class CourrierViewSet(viewsets.ModelViewSet):
         services = Service.objects.all().order_by('nom')
         serializer = ServiceSimpleSerializer(services, many=True)
         return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], url_path='pieces_jointes')
+    def ajouter_piece_jointe(self, request, pk=None):
+        """
+        Ajouter une ou plusieurs pièces jointes à un courrier existant.
+        URL : POST /api/courriers/{id}/pieces_jointes/
+        """
+        courrier = self.get_object()
+        fichiers = request.FILES.getlist('fichiers')
+        if not fichiers:
+            return Response({'error': 'Aucun fichier fourni.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        created = []
+        for f in fichiers:
+            ext = f.name.split('.')[-1].lower()
+            if ext == 'pdf':
+                ftype = 'pdf'
+            elif ext in ('jpg', 'jpeg', 'png', 'gif', 'webp'):
+                ftype = 'image'
+            else:
+                ftype = ext
+            pj = CourrierPieceJointe.objects.create(
+                courrier=courrier,
+                fichier=f,
+                nom_fichier=f.name,
+                file_type=ftype,
+                file_size=f.size,
+                uploaded_by=request.user,
+            )
+            created.append(pj)
+
+        from .serializer import CourrierPieceJointeSerializer
+        serializer = CourrierPieceJointeSerializer(created, many=True, context={'request': request})
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['delete'], url_path=r'pieces_jointes/(?P<pj_id>\d+)')
+    def supprimer_piece_jointe(self, request, pk=None, pj_id=None):
+        """
+        Supprimer une pièce jointe d'un courrier.
+        URL : DELETE /api/courriers/{id}/pieces_jointes/{pj_id}/
+        """
+        courrier = self.get_object()
+        try:
+            pj = CourrierPieceJointe.objects.get(id=pj_id, courrier=courrier)
+        except CourrierPieceJointe.DoesNotExist:
+            return Response({'error': 'Pièce jointe introuvable.'}, status=status.HTTP_404_NOT_FOUND)
+
+        pj.fichier.delete(save=False)  # Supprimer le fichier physique
+        pj.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # ============================================================================
@@ -1859,10 +2570,17 @@ class AffectationCourrierViewSet(viewsets.ModelViewSet):
         - RH/Admin : toutes les affectations
         """
         user = self.request.user
+        queryset = AffectationCourrier.objects.select_related(
+            'courrier', 
+            'utilisateur', 
+            'utilisateur__service',
+            'affecte_par'
+        )
+        
         if user.role in ['rh', 'admin']:
-            return AffectationCourrier.objects.all()
+            return queryset
         else:
-            return AffectationCourrier.objects.filter(utilisateur=user)
+            return queryset.filter(utilisateur=user)
     
     @action(detail=True, methods=['post'])
     def marquer_lu(self, request, pk=None):
@@ -1885,6 +2603,128 @@ class AffectationCourrierViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
     
     @action(detail=True, methods=['post'])
+    def commencer_traitement(self, request, pk=None):
+        """
+        L'utilisateur clique "Traiter" après avoir vu le courrier.
+        - informatif  → directement 'valide'
+        - autres      → 'en_traitement'
+        URL : POST /api/affectations/{id}/commencer_traitement/
+        """
+        affectation = self.get_object()
+        
+        if affectation.utilisateur != request.user:
+            return Response(
+                {'error': 'Vous ne pouvez modifier que vos propres affectations'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        if affectation.statut not in ['distribue', 'vu', 'en_attente', 'lu']:
+            return Response(
+                {'error': 'Cette affectation ne peut plus être mise en traitement'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        affectation.traiter()
+        ActionLog.log_action(
+            action_type='affectation_start',
+            utilisateur=request.user,
+            description=f"Traitement commencé pour le courrier {affectation.courrier.numero_registre}",
+            courrier=affectation.courrier,
+            affectation=affectation,
+            request=request,
+        )
+        serializer = self.get_serializer(affectation)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def renvoyer(self, request, pk=None):
+        """
+        L'utilisateur renvoie le courrier.
+        URL : POST /api/affectations/{id}/renvoyer/
+        Body : { "commentaire": "..." }  (optionnel)
+        """
+        affectation = self.get_object()
+        if affectation.utilisateur != request.user:
+            return Response(
+                {'error': 'Vous ne pouvez modifier que vos propres affectations'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        commentaire = request.data.get('commentaire', '')
+        affectation.renvoyer(commentaire)
+        ActionLog.log_action(
+            action_type='affectation_renvoye',
+            utilisateur=request.user,
+            description=f"Courrier {affectation.courrier.numero_registre} renvoyé",
+            courrier=affectation.courrier,
+            affectation=affectation,
+            request=request,
+        )
+        serializer = self.get_serializer(affectation)
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['post'])
+    def accuser_reception(self, request, pk=None):
+        """
+        Accuser réception d'un courrier.
+        URL : POST /api/affectations/{id}/accuser_reception/
+        Body : { "commentaire": "Réceptionné" }  (optionnel)
+        """
+        affectation = self.get_object()
+        if affectation.utilisateur != request.user:
+            return Response(
+                {'error': 'Vous ne pouvez modifier que vos propres affectations'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        if affectation.statut not in ['vu', 'distribue', 'en_attente', 'lu']:
+            return Response(
+                {'error': 'Action non autorisée pour ce statut'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        commentaire = request.data.get('commentaire', '')
+        affectation.accuser_reception(commentaire)
+        ActionLog.log_action(
+            action_type='affectation_accuse',
+            utilisateur=request.user,
+            description=f"Accusé de réception pour le courrier {affectation.courrier.numero_registre}",
+            courrier=affectation.courrier,
+            affectation=affectation,
+            request=request,
+        )
+        serializer = self.get_serializer(affectation)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def repondre(self, request, pk=None):
+        """
+        Répondre à un courrier.
+        URL : POST /api/affectations/{id}/repondre/
+        Body : { "commentaire": "Réponse ..." }  (optionnel)
+        """
+        affectation = self.get_object()
+        if affectation.utilisateur != request.user:
+            return Response(
+                {'error': 'Vous ne pouvez modifier que vos propres affectations'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        if affectation.statut not in ['vu', 'distribue', 'en_attente', 'lu']:
+            return Response(
+                {'error': 'Action non autorisée pour ce statut'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        commentaire = request.data.get('commentaire', '')
+        affectation.repondre(commentaire)
+        ActionLog.log_action(
+            action_type='affectation_repondre',
+            utilisateur=request.user,
+            description=f"Réponse enregistrée pour le courrier {affectation.courrier.numero_registre}",
+            courrier=affectation.courrier,
+            affectation=affectation,
+            request=request,
+        )
+        serializer = self.get_serializer(affectation)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
     def valider(self, request, pk=None):
         """
         Valider une affectation de courrier.
@@ -1901,7 +2741,14 @@ class AffectationCourrierViewSet(viewsets.ModelViewSet):
         
         commentaire = request.data.get('commentaire', '')
         affectation.valider(commentaire)
-        
+        ActionLog.log_action(
+            action_type='affectation_validate',
+            utilisateur=request.user,
+            description=f"Courrier {affectation.courrier.numero_registre} validé",
+            courrier=affectation.courrier,
+            affectation=affectation,
+            request=request,
+        )
         serializer = self.get_serializer(affectation)
         return Response(serializer.data)
     
@@ -1928,7 +2775,14 @@ class AffectationCourrierViewSet(viewsets.ModelViewSet):
             )
         
         affectation.rejeter(motif)
-        
+        ActionLog.log_action(
+            action_type='affectation_reject',
+            utilisateur=request.user,
+            description=f"Courrier {affectation.courrier.numero_registre} rejeté : {motif}",
+            courrier=affectation.courrier,
+            affectation=affectation,
+            request=request,
+        )
         serializer = self.get_serializer(affectation)
         return Response(serializer.data)
     
@@ -2046,7 +2900,14 @@ class AffectationCourrierViewSet(viewsets.ModelViewSet):
             
             # Marquer l'affectation comme signée
             affectation.signer(commentaire)
-            
+            ActionLog.log_action(
+                action_type='affectation_sign',
+                utilisateur=request.user,
+                description=f"Courrier {courrier.numero_registre} signé électroniquement",
+                courrier=courrier,
+                affectation=affectation,
+                request=request,
+            )
             print(f"✅ Version {nouveau_numero} créée pour le courrier {courrier.numero_registre}")
             
             serializer = self.get_serializer(affectation)
@@ -2090,8 +2951,14 @@ class AffectationCourrierViewSet(viewsets.ModelViewSet):
                 auteur=request.user,
                 contenu=contenu
             )
-            
-            # Notifier tous les utilisateurs (pour démo)
+            ActionLog.log_action(
+                action_type='commentaire_add',
+                utilisateur=request.user,
+                description=f"Commentaire ajouté sur le courrier {affectation.courrier.numero_registre}",
+                courrier=affectation.courrier,
+                affectation=affectation,
+                request=request,
+            )
             from users.utils import creer_notification
             
             # Récupérer tous les utilisateurs actifs sauf l'auteur du commentaire
@@ -2117,167 +2984,5 @@ class AffectationCourrierViewSet(viewsets.ModelViewSet):
             serializer = CommentaireCourrierSerializer(commentaire)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
     
-    @action(detail=True, methods=['post'])
-    def reaffecter(self, request, pk=None):
-        """
-        Réaffecter un courrier à un autre service.
-        Identique à l'affectation initiale mais change le service concerné.
-        URL : POST /api/affectations/{id}/reaffecter/
-        Body : { 
-            "service_id": 123,  # ID du nouveau service
-            "mode": "plateforme" ou "email"
-        }
-        """
-        affectation = self.get_object()
-        
-        # Vérifier que c'est bien l'utilisateur concerné qui réaffecte
-        if affectation.utilisateur != request.user:
-            return Response(
-                {'error': 'Vous ne pouvez réaffecter que vos propres affectations'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
-        service_id = request.data.get('service_id')
-        mode = request.data.get('mode', 'plateforme')
-        
-        if not service_id:
-            return Response(
-                {'error': 'Vous devez spécifier un service'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        courrier = affectation.courrier
-        
-        try:
-            # Récupérer le nouveau service
-            from users.models import Service
-            nouveau_service = Service.objects.get(id=service_id)
-            ancien_service_nom = courrier.get_service_concerne_display() if courrier.service_concerne else "Non défini"
-            
-            # Mapper le nom du service vers le code
-            service_mapping = {
-                'Ressources Humaines': 'rh',
-                'RH': 'rh',
-                'Comptabilité': 'comptabilite',
-                'Direction': 'direction',
-                'Direction Générale': 'direction',
-                'Service Technique': 'technique',
-                'Technique': 'technique',
-                'Commercial': 'commercial',
-                'Juridique': 'juridique',
-                'Informatique': 'informatique',
-                'IT': 'informatique',
-                'Logistique': 'logistique',
-            }
-            
-            # Obtenir le code du service
-            service_code = service_mapping.get(nouveau_service.nom, 'autre')
-            
-            # Modifier le service concerné du courrier
-            courrier.service_concerne = service_code
-            courrier.save()
-            
-            # Marquer l'ancienne affectation comme transférée
-            affectation.statut = 'valide'
-            affectation.commentaire_traitement = f"Transféré au service {nouveau_service.nom}"
-            affectation.date_traitement = timezone.now()
-            affectation.save()
-            
-            # Créer de nouvelles affectations pour tous les utilisateurs du nouveau service
-            utilisateurs_service = nouveau_service.utilisateurs.filter(is_active=True)
-            
-            if not utilisateurs_service.exists():
-                return Response(
-                    {'error': f'Aucun utilisateur actif trouvé dans le service {nouveau_service.nom}'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            nouvelles_affectations = []
-            from users.utils import creer_notification
-            
-            for utilisateur in utilisateurs_service:
-                nouvelle_affectation = AffectationCourrier.objects.create(
-                    courrier=courrier,
-                    utilisateur=utilisateur,
-                    affecte_par=request.user,
-                    note=f"Transféré de {ancien_service_nom} par {request.user.get_full_name() or request.user.username}",
-                    statut='en_attente'
-                )
-                nouvelles_affectations.append(nouvelle_affectation)
-                
-                # Notifier chaque utilisateur
-                creer_notification(
-                    utilisateur=utilisateur,
-                    type_notif='affectation',
-                    titre=f'Courrier transféré: {courrier.numero_registre}',
-                    message=f'{request.user.get_full_name() or request.user.username} a transféré le courrier "{courrier.objet}" à votre service.',
-                    courrier_id=courrier.id,
-                )
-            
-            return Response({
-                'message': f'Courrier réaffecté au service {nouveau_service.nom}',
-                'nb_affectations': len(nouvelles_affectations),
-                'service': nouveau_service.nom
-            }, status=status.HTTP_200_OK)
-                
-        except Service.DoesNotExist:
-            return Response(
-                {'error': 'Service introuvable'},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            return Response(
-                {'error': f'Erreur lors de la réaffectation: {str(e)}'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
 
 
-class CommentaireCourrierViewSet(viewsets.ModelViewSet):
-    """
-    ViewSet pour gérer les commentaires sur les affectations
-    """
-    queryset = CommentaireCourrier.objects.all()
-    serializer_class = CommentaireCourrierSerializer
-    permission_classes = [IsAuthenticated]
-    ordering = ['-date_creation']
-    
-    def get_queryset(self):
-        """
-        Filtrer les commentaires selon l'utilisateur :
-        - Utilisateurs normaux : commentaires de leurs affectations seulement
-        - RH/Admin : tous les commentaires
-        """
-        user = self.request.user
-        if user.role in ['rh', 'admin']:
-            return CommentaireCourrier.objects.all()
-        else:
-            # Commentaires sur les affectations de cet utilisateur ou faits par lui
-            return CommentaireCourrier.objects.filter(
-                Q(affectation__utilisateur=user) | Q(auteur=user)
-            )
-    
-    def perform_create(self, serializer):
-        """Attribuer l'auteur automatiquement et notifier les autres utilisateurs concernés"""
-        commentaire = serializer.save(auteur=self.request.user)
-        
-        # Notifier les autres utilisateurs concernés par ce courrier
-        from users.utils import creer_notification
-        
-        # Récupérer tous les utilisateurs qui ont des affectations sur ce courrier, sauf l'auteur du commentaire
-        utilisateurs_concernes = commentaire.affectation.courrier.affectations.exclude(
-            utilisateur=self.request.user
-        ).values_list('utilisateur', flat=True).distinct()
-        
-        for utilisateur_id in utilisateurs_concernes:
-            try:
-                creer_notification(
-                    utilisateur=utilisateur_id,
-                    type_notif='commentaire',
-                    titre=f'Nouveau commentaire: {commentaire.affectation.courrier.numero_registre}',
-                    message=f'{self.request.user.get_full_name() or self.request.user.username} a ajouté un commentaire sur le courrier "{commentaire.affectation.courrier.objet}".',
-                    courrier_id=commentaire.affectation.courrier.id,
-                )
-            except Exception as e:
-                print(f"Erreur lors de la création de notification: {e}")

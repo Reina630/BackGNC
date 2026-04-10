@@ -154,6 +154,7 @@ class Courrier(models.Model):
     
     # Choix pour le statut de traitement
     STATUS_CHOICES = [
+        ('brouillon', 'Brouillon'),
         ('recu', 'Reçu'),
         ('en_traitement', 'En traitement'),
         ('traite', 'Traité'),
@@ -283,6 +284,14 @@ class Courrier(models.Model):
         help_text="Référence du courrier (ex: N°123/DIR/2026)"
     )
     
+    # Référence de la structure externe (organisme, entreprise, etc.)
+    reference_structure = models.CharField(
+        max_length=200,
+        blank=True,
+        default='',
+        help_text="Référence de la structure externe (ex: N°ABC123 de l'organisme X)"
+    )
+    
     # Catégorie du courrier (devis, demande, facture, etc.)
     categorie = models.ForeignKey(
         Categorie,
@@ -380,6 +389,23 @@ class Courrier(models.Model):
         help_text="Date et heure de dernière modification"
     )
     
+    # ===== RÉPONSE À UN COURRIER =====
+    reponse_a = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='reponses',
+        help_text="Courrier original auquel ce courrier est une réponse"
+    )
+
+    # Contenu de la lettre (HTML) pour les brouillons rédigés sur la plateforme
+    contenu_lettre = models.TextField(
+        blank=True,
+        null=True,
+        help_text="Contenu HTML de la lettre rédigée sur la plateforme"
+    )
+
     # ===== ARCHIVAGE (SOFT DELETE) =====
     is_deleted = models.BooleanField(default=False, help_text='Courrier archivé/supprimé')
     deleted_at = models.DateTimeField(null=True, blank=True, help_text='Date de suppression')
@@ -398,27 +424,39 @@ class Courrier(models.Model):
     def save(self, *args, **kwargs):
         """
         Surcharge de la méthode save pour générer automatiquement
-        le numéro de registre au format ANNÉE-NNNN
+        le numéro de registre au format TYPE-ANNÉE-MOIS-NNNN
+        Ex: ENT-2026-03-0001 (entrant), SORT-2026-03-0001 (sortant), INT-2026-03-0001 (interne)
+        Le compteur est indépendant par type, par année et par mois.
         """
         if not self.numero_registre:
             from django.utils import timezone
-            year = timezone.now().year
-            
-            # Compter les courriers de l'année en cours
+            now = timezone.now()
+            year = now.year
+            month = now.month
+
+            # Préfixe selon le type de courrier
+            prefix_map = {
+                'entrant': 'CE',
+                'sortant': 'CS',
+                'interne': 'CI',
+            }
+            prefix = prefix_map.get(self.type_courrier, 'COU')
+
+            # Dernier numéro pour ce type, cette année et ce mois
             last_courrier = Courrier.objects.filter(
-                numero_registre__startswith=f"{year}-"
+                numero_registre__startswith=f"{prefix}-{year}-{month:02d}-"
             ).order_by('-numero_registre').first()
-            
+
             if last_courrier:
-                # Extraire le numéro et incrémenter
-                last_number = int(last_courrier.numero_registre.split('-')[1])
+                # Extraire la partie numérique (4ème segment : TYPE-ANNÉE-MOIS-NNNN)
+                last_number = int(last_courrier.numero_registre.split('-')[3])
                 new_number = last_number + 1
             else:
-                # Premier courrier de l'année
+                # Premier courrier de ce type pour ce mois
                 new_number = 1
-            
-            # Générer le numéro avec padding (ex: 2026-0001)
-            self.numero_registre = f"{year}-{new_number:04d}"
+
+            # Générer le numéro avec padding (ex: ENT-2026-03-0001)
+            self.numero_registre = f"{prefix}-{year}-{month:02d}-{new_number:04d}"
         
         super().save(*args, **kwargs)
     
@@ -620,6 +658,59 @@ class FichierCourrierVersion(models.Model):
         return f"{self.courrier.numero_registre} - V{self.version_number}"
 
 
+class CourrierPieceJointe(models.Model):
+    """
+    Pièces jointes multiples d'un courrier.
+    Un courrier peut avoir plusieurs fichiers attachés.
+    """
+    courrier = models.ForeignKey(
+        Courrier,
+        on_delete=models.CASCADE,
+        related_name='pieces_jointes',
+        help_text="Courrier auquel appartient cette pièce jointe"
+    )
+
+    fichier = models.FileField(
+        upload_to='courriers/pieces_jointes/%Y/%m/',
+        help_text="Fichier joint"
+    )
+
+    nom_fichier = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text="Nom original du fichier"
+    )
+
+    file_type = models.CharField(
+        max_length=20,
+        default='pdf',
+        help_text="Type de fichier (pdf, image, etc.)"
+    )
+
+    file_size = models.BigIntegerField(
+        default=0,
+        help_text="Taille du fichier en octets"
+    )
+
+    uploaded_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='pieces_jointes_uploadees',
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+        verbose_name = "Pièce jointe"
+        verbose_name_plural = "Pièces jointes"
+
+    def __str__(self):
+        return f"{self.courrier.numero_registre} - {self.nom_fichier}"
+
+
 class PartageLog(models.Model):
     """
     Modèle pour tracer tous les partages de courriers
@@ -695,25 +786,76 @@ class AffectationCourrier(models.Model):
     Modèle pour gérer l'affectation des courriers aux utilisateurs via la plateforme
     """
     STATUT_CHOICES = [
-        ('en_attente', 'En attente'),
-        ('lu', 'Lu'),
+        ('distribue', 'Distribué'),
+        ('vu', 'Vu'),
         ('en_traitement', 'En traitement'),
-        ('valide', 'Validé'),
-        ('rejete', 'Rejeté'),
+        ('valide', 'Traité'),
         ('signe', 'Signé'),
+        ('rejete', 'Rejeté'),
+        ('renvoye', 'Renvoyé'),
+        # Anciens statuts gardés pour compatibilité
+        ('en_attente', 'En attente'),
+        ('lu', 'Vu'),
+    ]
+    
+    NIVEAU_URGENCE_CHOICES = [
+        ('faible', 'Faible'),
+        ('normal', 'Normal'),
+        ('eleve', 'Élevé'),
+        ('critique', 'Critique'),
+    ]
+
+    ACTION_REQUISE_CHOICES = [
+        ('informatif', 'À titre informatif'),
+        ('a_signer', 'À signer'),
+        ('accusation_reception', 'À accuser de réception'),
+        ('a_repondre', 'À répondre'),
     ]
     
     # Relations
     courrier = models.ForeignKey(Courrier, on_delete=models.CASCADE, related_name='affectations')
     utilisateur = models.ForeignKey(User, on_delete=models.CASCADE, related_name='courriers_affectes')
     affecte_par = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='affectations_creees')
-    
+    circuit = models.ForeignKey(
+        'CircuitAffectation',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='affectations',
+        help_text="Circuit d'affectation auquel appartient cette affectation (optionnel)"
+    )
+
+    # Étape (pour circuit séquentiel)
+    etape_numero = models.PositiveIntegerField(
+        default=1,
+        help_text="Numéro d'étape dans le circuit (mode séquentiel)"
+    )
+
     # Informations
     note = models.TextField(blank=True, help_text="Note de l'affecteur")
-    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default='en_attente')
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default='distribue')
     commentaire_traitement = models.TextField(blank=True, help_text="Commentaire de l'utilisateur lors du traitement")
     motif_rejet = models.TextField(blank=True, help_text="Motif en cas de rejet")
     
+    # Niveau d'urgence et délai
+    niveau_urgence = models.CharField(
+        max_length=20, 
+        choices=NIVEAU_URGENCE_CHOICES, 
+        default='normal',
+        help_text="Niveau d'urgence du traitement"
+    )
+    date_echeance = models.DateTimeField(
+        null=True, 
+        blank=True,
+        help_text="Date et heure limite pour traiter le courrier"
+    )
+    action_requise = models.CharField(
+        max_length=30,
+        choices=ACTION_REQUISE_CHOICES,
+        default='informatif',
+        help_text="Action requise de la part du destinataire"
+    )
+
     # Métadonnées
     date_affectation = models.DateTimeField(auto_now_add=True)
     date_lecture = models.DateTimeField(null=True, blank=True, help_text="Date de première lecture")
@@ -733,14 +875,44 @@ class AffectationCourrier(models.Model):
         return f"{self.courrier.numero_registre} → {self.utilisateur.username} ({self.get_statut_display()})"
     
     def marquer_comme_lu(self):
-        """Marque l'affectation comme lue"""
+        """
+        Ouvre l'affectation pour la première fois → passe à 'vu'.
+        """
+        if self.statut not in ('distribue', 'en_attente', 'lu'):
+            return  # déjà vu/traité
+        from django.utils import timezone
         if not self.date_lecture:
-            from django.utils import timezone
             self.date_lecture = timezone.now()
-            if self.statut == 'en_attente':
-                self.statut = 'lu'
+        self.statut = 'vu'
+        self.save()
+
+    def traiter(self):
+        """
+        L'utilisateur clique sur "Traiter" après avoir vu le courrier.
+        - informatif         → directement 'valide' (rien à faire)
+        - autres             → 'en_traitement', attente de l'action spécifique
+        """
+        from django.utils import timezone
+        if self.action_requise == 'informatif':
+            self.statut = 'valide'
+            self.date_traitement = timezone.now()
             self.save()
-    
+            self._update_courrier_statut()
+        else:
+            self.statut = 'en_traitement'
+            self.save()
+
+    def renvoyer(self, commentaire=''):
+        """Renvoie le courrier — l'affectation est clôturée et le courrier revient en file 'À traiter' pour le RH."""
+        from django.utils import timezone
+        self.statut = 'renvoye'
+        self.commentaire_traitement = commentaire
+        self.date_traitement = timezone.now()
+        self.save()
+        # Remettre le courrier dans la file "À traiter" du tracker RH
+        self.courrier.statut = 'recu'
+        self.courrier.save()
+
     def valider(self, commentaire=''):
         """Valide le courrier"""
         from django.utils import timezone
@@ -748,7 +920,24 @@ class AffectationCourrier(models.Model):
         self.commentaire_traitement = commentaire
         self.date_traitement = timezone.now()
         self.save()
-        # Mettre à jour le statut du courrier vers "traité"
+        self._update_courrier_statut()
+
+    def accuser_reception(self, commentaire=''):
+        """Accuse réception du courrier"""
+        from django.utils import timezone
+        self.statut = 'valide'
+        self.commentaire_traitement = commentaire or 'Accusé de réception'
+        self.date_traitement = timezone.now()
+        self.save()
+        self._update_courrier_statut()
+
+    def repondre(self, commentaire=''):
+        """Répond au courrier"""
+        from django.utils import timezone
+        self.statut = 'valide'
+        self.commentaire_traitement = commentaire or 'Répondu'
+        self.date_traitement = timezone.now()
+        self.save()
         self._update_courrier_statut()
     
     def rejeter(self, motif=''):
@@ -771,18 +960,26 @@ class AffectationCourrier(models.Model):
         # Mettre à jour le statut du courrier vers "traité"
         self._update_courrier_statut()
     
+    def peut_etre_traitee(self):
+        """Vérifie si cette affectation peut être traitée maintenant (mode séquentiel)."""
+        if not self.circuit or self.circuit.type_circuit == 'simultane':
+            return True
+        etape_actuelle = self.circuit.get_etape_actuelle()
+        return etape_actuelle is None or self.etape_numero == etape_actuelle
+
     def _update_courrier_statut(self):
         """
-        Met à jour le statut du courrier associé à cette affectation.
-        Si toutes les affectations ont été traitées (validé/rejeté/signé), 
-        le courrier passe à "traité".
+        Si toutes les affectations pertinentes sont traitées, le courrier passe à 'traité'.
+        En circuit : vérifie toutes les affectations du circuit.
+        Hors circuit : vérifie toutes les affectations du courrier.
         """
-        # Vérifier si toutes les affectations du courrier sont traitées
-        affectations = self.courrier.affectations.all()
+        if self.circuit:
+            affectations = self.circuit.affectations.all()
+        else:
+            affectations = self.courrier.affectations.all()
         statuts_traites = ['valide', 'rejete', 'signe']
-        
-        # Si toutes les affectations sont dans un statut "traité"
-        if all(aff.statut in statuts_traites for aff in affectations):
+
+        if affectations.exists() and all(aff.statut in statuts_traites for aff in affectations):
             self.courrier.statut = 'traite'
             self.courrier.save()
 
@@ -803,3 +1000,275 @@ class CommentaireCourrier(models.Model):
     
     def __str__(self):
         return f"Commentaire de {self.auteur.username} sur {self.affectation.courrier.numero_registre}"
+
+
+class ActionLog(models.Model):
+    """
+    Modèle générique pour logger toutes les actions des utilisateurs sur la plateforme.
+    Sert de journal d'audit complet.
+    """
+    TYPE_ACTION_CHOICES = [
+        # Courriers
+        ('courrier_create', 'Création de courrier'),
+        ('courrier_update', 'Modification de courrier'),
+        ('courrier_delete', 'Suppression de courrier'),
+        ('courrier_restore', 'Restauration de courrier'),
+        ('courrier_archive', 'Archivage de courrier'),
+        
+        # Affectations
+        ('affectation_create', 'Affectation de courrier'),
+        ('affectation_accuse', 'Accusé de réception'),
+        ('affectation_start', 'Début de traitement'),
+        ('affectation_validate', 'Validation'),
+        ('affectation_reject', 'Rejet'),
+        ('affectation_sign', 'Signature'),
+        ('affectation_renvoye', 'Renvoi de courrier'),
+        ('affectation_repondre', 'Réponse au courrier'),
+        
+        # Partages
+        ('partage_email', 'Partage par email'),
+        ('partage_whatsapp', 'Partage par WhatsApp'),
+        
+        # Commentaires
+        ('commentaire_add', 'Ajout de commentaire'),
+        
+        # Documents
+        ('document_create', 'Création de document'),
+        ('document_update', 'Modification de document'),
+        ('document_delete', 'Suppression de document'),
+        ('document_share', 'Partage de document'),
+        
+        # Utilisateurs
+        ('user_login', 'Connexion'),
+        ('user_logout', 'Déconnexion'),
+        ('user_create', 'Création d\'utilisateur'),
+        ('user_update', 'Modification d\'utilisateur'),
+        ('user_delete', 'Suppression d\'utilisateur'),
+        
+        # Autres
+        ('urgent_mark', 'Marquage urgent'),
+        ('urgent_unmark', 'Retrait marquage urgent'),
+    ]
+    
+    # Informations de l'action
+    action_type = models.CharField(max_length=50, choices=TYPE_ACTION_CHOICES)
+    description = models.TextField()  # Description lisible de l'action
+    utilisateur = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='actions_log')
+    utilisateur_username = models.CharField(max_length=150)  # Backup si l'utilisateur est supprimé
+    utilisateur_nom_complet = models.CharField(max_length=255, blank=True)
+    
+    # Cibles de l'action (optionnel, selon le type d'action)
+    courrier = models.ForeignKey('Courrier', on_delete=models.SET_NULL, null=True, blank=True, related_name='actions_log')
+    courrier_numero = models.CharField(max_length=100, blank=True)  # Backup
+    
+    document = models.ForeignKey('Document', on_delete=models.SET_NULL, null=True, blank=True, related_name='actions_log')
+    document_nom = models.CharField(max_length=255, blank=True)  # Backup
+    
+    affectation = models.ForeignKey('AffectationCourrier', on_delete=models.SET_NULL, null=True, blank=True, related_name='actions_log')
+    
+    # Métadonnées
+    timestamp = models.DateTimeField(auto_now_add=True, db_index=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.TextField(blank=True)
+    
+    # Données supplémentaires (JSON pour flexibilité)
+    metadata = models.JSONField(default=dict, blank=True)
+    
+    class Meta:
+        ordering = ['-timestamp']
+        verbose_name = 'Log d\'action'
+        verbose_name_plural = 'Logs d\'actions'
+        indexes = [
+            models.Index(fields=['-timestamp']),
+            models.Index(fields=['action_type', '-timestamp']),
+            models.Index(fields=['utilisateur', '-timestamp']),
+        ]
+    
+    def __str__(self):
+        return f"[{self.timestamp.strftime('%Y-%m-%d %H:%M')}] {self.utilisateur_username} - {self.get_action_type_display()}"
+    
+    @classmethod
+    def log_action(cls, action_type, utilisateur, description, courrier=None, document=None, affectation=None, request=None, **metadata):
+        """
+        Méthode utilitaire pour créer un log d'action facilement.
+        
+        Exemple:
+            ActionLog.log_action(
+                action_type='courrier_create',
+                utilisateur=request.user,
+                description=f"Création du courrier {courrier.numero_registre}",
+                courrier=courrier,
+                request=request
+            )
+        """
+        log = cls(
+            action_type=action_type,
+            description=description,
+            utilisateur=utilisateur,
+            utilisateur_username=utilisateur.username,
+            utilisateur_nom_complet=utilisateur.get_full_name() or utilisateur.username,
+            courrier=courrier,
+            courrier_numero=courrier.numero_registre if courrier else '',
+            document=document,
+            document_nom=document.nom if document else '',
+            affectation=affectation,
+            metadata=metadata
+        )
+        
+        # Extraire les infos de la requête HTTP si disponible
+        if request:
+            # Get IP address
+            x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+            if x_forwarded_for:
+                log.ip_address = x_forwarded_for.split(',')[0]
+            else:
+                log.ip_address = request.META.get('REMOTE_ADDR')
+            
+            # Get user agent
+            log.user_agent = request.META.get('HTTP_USER_AGENT', '')[:500]  # Limité à 500 chars
+        
+        log.save()
+        return log
+
+
+# ============================================================================
+# MODÈLES POUR LES CIRCUITS D'AFFECTATION MULTI-SERVICES
+# ============================================================================
+
+class CircuitAffectation(models.Model):
+    """
+    Modèle pour gérer les circuits d'affectation de courriers à plusieurs services.
+    Supporte deux modes : simultané (parallèle) et séquentiel.
+    """
+    TYPE_CIRCUIT_CHOICES = [
+        ('simultane', 'Simultané'),
+        ('sequentiel', 'Séquentiel'),
+    ]
+    
+    # Relations
+    courrier = models.OneToOneField(
+        Courrier, 
+        on_delete=models.CASCADE, 
+        related_name='circuit_affectation',
+        help_text="Courrier concerné par ce circuit"
+    )
+    cree_par = models.ForeignKey(
+        User, 
+        on_delete=models.SET_NULL, 
+        null=True, 
+        related_name='circuits_crees',
+        help_text="Utilisateur qui a créé ce circuit"
+    )
+    
+    # Configuration du circuit
+    type_circuit = models.CharField(
+        max_length=20,
+        choices=TYPE_CIRCUIT_CHOICES,
+        default='simultane',
+        help_text="Type de circuit : simultané (tous en même temps) ou séquentiel (par étapes)"
+    )
+    
+    # Métadonnées
+    date_creation = models.DateTimeField(auto_now_add=True)
+    date_modification = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        ordering = ['-date_creation']
+        verbose_name = 'Circuit d\'affectation'
+        verbose_name_plural = 'Circuits d\'affectation'
+    
+    def __str__(self):
+        return f"Circuit {self.get_type_circuit_display()} - {self.courrier.numero_registre}"
+    
+    def est_termine(self):
+        """Vérifie si toutes les affectations du circuit sont terminées"""
+        affectations = self.affectations.all()
+        if not affectations.exists():
+            return False
+        statuts_termines = ['valide', 'rejete', 'signe']
+        return all(aff.statut in statuts_termines for aff in affectations)
+
+    def get_etape_actuelle(self):
+        """Retourne le numéro de l'étape en cours (mode séquentiel uniquement)"""
+        if self.type_circuit != 'sequentiel':
+            return None
+
+        # Chercher la première étape non complètement terminée
+        affectations = self.affectations.order_by('etape_numero')
+        etapes = {}
+        for aff in affectations:
+            if aff.etape_numero not in etapes:
+                etapes[aff.etape_numero] = []
+            etapes[aff.etape_numero].append(aff)
+
+        statuts_termines = ['valide', 'rejete', 'signe']
+        for num_etape in sorted(etapes.keys()):
+            if not all(a.statut in statuts_termines for a in etapes[num_etape]):
+                return num_etape
+
+        return None
+
+    
+    def __str__(self):
+        return f"{self.circuit.courrier.numero_registre} → {self.service.nom} (Étape {self.etape_numero})"
+    
+    def peut_etre_traitee(self):
+        """
+        Vérifie si cette affectation peut être traitée maintenant.
+        En mode séquentiel, vérifie que l'étape précédente est terminée.
+        """
+        if self.circuit.type_circuit == 'simultane':
+            return True
+        
+        # Mode séquentiel : vérifier que toutes les étapes précédentes sont terminées
+        etape_actuelle = self.circuit.get_etape_actuelle()
+        return etape_actuelle is None or self.etape_numero == etape_actuelle
+    
+    def marquer_comme_vu(self):
+        """Marque l'affectation comme vue"""
+        if self.statut == 'en_attente' or self.statut == 'distribue':
+            from django.utils import timezone
+            self.statut = 'vu'
+            if not self.date_lecture:
+                self.date_lecture = timezone.now()
+            self.save()
+    
+    def traiter(self):
+        """Démarre le traitement de l'affectation"""
+        if self.statut in ['en_attente', 'distribue', 'vu']:
+            self.statut = 'en_traitement'
+            self.save()
+    
+    def valider(self, commentaire=''):
+        """Valide l'affectation"""
+        from django.utils import timezone
+        self.statut = 'valide'
+        self.commentaire_traitement = commentaire
+        self.date_traitement = timezone.now()
+        self.save()
+        self._verifier_circuit_termine()
+    
+    def signer(self, commentaire=''):
+        """Signe l'affectation"""
+        from django.utils import timezone
+        self.statut = 'signe'
+        self.commentaire_traitement = commentaire
+        self.date_traitement = timezone.now()
+        self.save()
+        self._verifier_circuit_termine()
+    
+    def rejeter(self, motif=''):
+        """Rejette l'affectation"""
+        from django.utils import timezone
+        self.statut = 'rejete'
+        self.motif_rejet = motif
+        self.date_traitement = timezone.now()
+        self.save()
+        self._verifier_circuit_termine()
+    
+    def _verifier_circuit_termine(self):
+        """Vérifie si le circuit est terminé et met à jour le statut du courrier"""
+        if self.circuit.est_termine():
+            self.circuit.courrier.statut = 'traite'
+            self.circuit.courrier.save()
+

@@ -1,7 +1,8 @@
 from rest_framework import serializers
 from .models import (
     Document, DocumentVersion, DocumentShare, ShareRequest, 
-    Courrier, PartageLog, Categorie, AffectationCourrier, CommentaireCourrier
+    Courrier, PartageLog, Categorie, AffectationCourrier, CommentaireCourrier,
+    CourrierPieceJointe, ActionLog
 )
 from users.models import User, Service
 from tags.serializers import TagSerializer
@@ -138,9 +139,103 @@ class UserSimpleSerializer(serializers.ModelSerializer):
         fields = ['id', 'username', 'email', 'first_name', 'last_name']
 
 
+class ServiceSimpleSerializer(serializers.ModelSerializer):
+    """Serializer simple pour les services"""
+    class Meta:
+        model = Service
+        fields = ['id', 'nom', 'description']
+
+
+class AffectationV2SimpleSerializer(serializers.Serializer):
+    """Serializer simple pour les affectations v2 (pour inclusion dans Courrier)"""
+    id = serializers.SerializerMethodField()
+    circuit = serializers.SerializerMethodField()
+    destinataire = serializers.SerializerMethodField()
+    destinataire_nom = serializers.SerializerMethodField()
+    service = serializers.SerializerMethodField()
+    service_nom = serializers.SerializerMethodField()
+    action_requise = serializers.CharField(read_only=True)
+    niveau_urgence = serializers.CharField(read_only=True)
+    statut = serializers.CharField(read_only=True)
+    date_echeance = serializers.DateTimeField(allow_null=True, read_only=True)
+    date_traitement = serializers.DateTimeField(allow_null=True, read_only=True)
+    etape_numero = serializers.IntegerField(read_only=True)
+    peut_traiter = serializers.SerializerMethodField()
+
+    def get_id(self, obj):
+        return obj.id
+
+    def get_circuit(self, obj):
+        return obj.circuit.id if obj.circuit else None
+
+    def get_destinataire(self, obj):
+        return obj.destinataire.id if obj.destinataire else None
+
+    def get_destinataire_nom(self, obj):
+        if obj.destinataire:
+            return obj.destinataire.get_full_name() or obj.destinataire.username
+        return None
+
+    def get_service(self, obj):
+        return obj.service.id if obj.service else None
+
+    def get_service_nom(self, obj):
+        return obj.service.nom if obj.service else None
+
+    def get_peut_traiter(self, obj):
+        return obj.peut_etre_traitee()
+
+
 # ============================================================================
 # SERIALIZERS POUR LE REGISTRE DE COURRIER
 # ============================================================================
+
+class CourrierPieceJointeSerializer(serializers.ModelSerializer):
+    fichier_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CourrierPieceJointe
+        fields = ['id', 'fichier', 'fichier_url', 'nom_fichier', 'file_type', 'file_size', 'created_at']
+        read_only_fields = ['id', 'file_size', 'created_at']
+
+    def get_fichier_url(self, obj):
+        if obj.fichier:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.fichier.url)
+            return obj.fichier.url
+        return None
+
+
+class AffectationCourrierSimpleSerializer(serializers.ModelSerializer):
+    """Serializer simple pour afficher les affectations dans les détails d'un courrier"""
+    utilisateur_username = serializers.CharField(source='utilisateur.username', read_only=True)
+    utilisateur_nom_complet = serializers.SerializerMethodField()
+    utilisateur_service = serializers.CharField(source='utilisateur.service.nom', read_only=True, allow_null=True)
+    statut_display = serializers.CharField(source='get_statut_display', read_only=True)
+    action_requise_display = serializers.CharField(source='get_action_requise_display', read_only=True)
+    niveau_urgence_display = serializers.CharField(source='get_niveau_urgence_display', read_only=True)
+    circuit_id = serializers.IntegerField(source='circuit.id', read_only=True, allow_null=True)
+    peut_etre_traitee = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AffectationCourrier
+        fields = [
+            'id', 'utilisateur', 'utilisateur_username', 'utilisateur_nom_complet',
+            'utilisateur_service', 'statut', 'statut_display', 'action_requise',
+            'action_requise_display', 'niveau_urgence', 'niveau_urgence_display',
+            'date_echeance', 'note', 'date_affectation', 'date_lecture', 'date_traitement',
+            'circuit_id', 'etape_numero', 'peut_etre_traitee',
+        ]
+
+    def get_utilisateur_nom_complet(self, obj):
+        if obj.utilisateur.first_name and obj.utilisateur.last_name:
+            return f"{obj.utilisateur.first_name} {obj.utilisateur.last_name}"
+        return obj.utilisateur.username
+
+    def get_peut_etre_traitee(self, obj):
+        return obj.peut_etre_traitee()
+
 
 class CourrierSerializer(serializers.ModelSerializer):
     """
@@ -170,10 +265,34 @@ class CourrierSerializer(serializers.ModelSerializer):
     # URL complète du fichier
     fichier_url = serializers.SerializerMethodField()
     
+    # Pièces jointes multiples
+    pieces_jointes = CourrierPieceJointeSerializer(many=True, read_only=True)
+    
     # Gestion des versions
     version_label = serializers.SerializerMethodField()
     nombre_versions = serializers.SerializerMethodField()
     courrier_parent_numero = serializers.CharField(source='courrier_parent.numero_registre', read_only=True)
+
+    # Informations sur le courrier "en réponse à"
+    reponse_a_numero = serializers.CharField(source='reponse_a.numero_registre', read_only=True)
+    reponse_a_objet = serializers.CharField(source='reponse_a.objet', read_only=True)
+
+    # Dernière affectation (statut de traitement)
+    derniere_affectation_statut = serializers.SerializerMethodField()
+    derniere_affectation_statut_display = serializers.SerializerMethodField()
+    derniere_affectation_echeance = serializers.SerializerMethodField()
+    derniere_affectation_action_requise = serializers.SerializerMethodField()
+    derniere_affectation_action_requise_display = serializers.SerializerMethodField()
+    
+    # Informations sur le circuit d'affectation
+    a_circuit = serializers.SerializerMethodField()
+    nombre_affectations_circuit = serializers.SerializerMethodField()
+    
+    # Affectations de l'ancien système (système simple utilisateur par utilisateur)
+    affectations_list = AffectationCourrierSimpleSerializer(source='affectations', many=True, read_only=True)
+    
+    # Affectations du nouveau système v2 (circuits)
+    affectations_v2 = serializers.SerializerMethodField()
     
     class Meta:
         model = Courrier
@@ -198,6 +317,7 @@ class CourrierSerializer(serializers.ModelSerializer):
             'service_destinataire_display',
             'objet',
             'reference',
+            'reference_structure',
             'categorie',
             'categorie_name',
             'categorie_details',
@@ -209,6 +329,7 @@ class CourrierSerializer(serializers.ModelSerializer):
             'fichier_url',
             'file_type',
             'file_size',
+            'pieces_jointes',
             'notes',
             'urgent',
             'enregistre_par',
@@ -221,6 +342,22 @@ class CourrierSerializer(serializers.ModelSerializer):
             'version_label',
             'est_version_actuelle',
             'nombre_versions',
+            # Champs de réponse
+            'reponse_a',
+            'reponse_a_numero',
+            'reponse_a_objet',
+            'contenu_lettre',
+            # Statut de la dernière affectation
+            'derniere_affectation_statut',
+            'derniere_affectation_statut_display',
+            'derniere_affectation_echeance',
+            'derniere_affectation_action_requise',
+            'derniere_affectation_action_requise_display',
+            # Informations sur le circuit d'affectation
+            'a_circuit',
+            'nombre_affectations_circuit',
+            'affectations_list',
+            'affectations_v2',
             'created_at',
             'updated_at'
         ]
@@ -261,11 +398,149 @@ class CourrierSerializer(serializers.ModelSerializer):
     def get_nombre_versions(self, obj):
         """Retourne le nombre total de versions de ce courrier"""
         if obj.courrier_parent:
-            # Si c'est une version, compter les versions du parent + le parent
             return obj.courrier_parent.versions.count() + 1
         else:
-            # Si c'est le parent, compter ses versions + lui-même
             return obj.versions.count() + 1
+
+    def get_derniere_affectation_statut(self, obj):
+        """Retourne le statut de la dernière affectation active"""
+        # Si le courrier a un circuit, calculer le statut basé sur le circuit
+        try:
+            if hasattr(obj, 'circuit_affectation') and obj.circuit_affectation:
+                affectations_service = obj.circuit_affectation.affectations_service.all()
+                
+                if not affectations_service.exists():
+                    return None
+                
+                # Compter le nombre d'affectations vues/traitées
+                nb_vues = affectations_service.filter(
+                    statut__in=['vu', 'en_traitement', 'valide', 'signe']
+                ).count()
+                
+                # Si toutes sont terminées (validées ou signées)
+                nb_terminees = affectations_service.filter(
+                    statut__in=['valide', 'signe']
+                ).count()
+                
+                if nb_terminees == affectations_service.count():
+                    return 'traite'
+                elif nb_vues > 0:
+                    return 'distribue'  # On retourne 'distribue' avec le compteur dans display
+                else:
+                    return 'distribue'
+        except:
+            pass
+        
+        # Sinon, utiliser l'ancien système (AffectationCourrier)
+        latest = obj.affectations.first()  # trié par -date_affectation
+        return latest.statut if latest else None
+
+    def get_derniere_affectation_statut_display(self, obj):
+        """Retourne le libellé du statut de la dernière affectation"""
+        # Si le courrier a un circuit, calculer le libellé basé sur le circuit
+        try:
+            if hasattr(obj, 'circuit_affectation') and obj.circuit_affectation:
+                affectations_service = obj.circuit_affectation.affectations_service.all()
+                
+                if not affectations_service.exists():
+                    return None
+                
+                # Compter le nombre d'affectations vues/traitées
+                nb_vues = affectations_service.filter(
+                    statut__in=['vu', 'en_traitement', 'valide', 'signe']
+                ).count()
+                
+                # Si toutes sont terminées (validées ou signées)
+                nb_terminees = affectations_service.filter(
+                    statut__in=['valide', 'signe']
+                ).count()
+                
+                total = affectations_service.count()
+                
+                if nb_terminees == total:
+                    return 'Traité'
+                elif nb_vues > 0:
+                    return f'Distribué ({nb_vues})'
+                else:
+                    return 'Distribué'
+        except:
+            pass
+        
+        # Sinon, utiliser l'ancien système (AffectationCourrier)
+        latest = obj.affectations.first()
+        return latest.get_statut_display() if latest else None
+
+    def get_derniere_affectation_echeance(self, obj):
+        """Retourne la date d'échéance de la dernière affectation"""
+        # Pour les circuits, ne pas afficher d'échéance (chaque service peut avoir la sienne)
+        try:
+            if hasattr(obj, 'circuit_affectation') and obj.circuit_affectation:
+                return None
+        except:
+            pass
+        
+        # Ancien système
+        latest = obj.affectations.first()
+        return latest.date_echeance.isoformat() if latest and latest.date_echeance else None
+
+    def get_derniere_affectation_action_requise(self, obj):
+        """Retourne l'action requise de la dernière affectation"""
+        # Pour les circuits, ne pas afficher d'action (chaque service peut avoir la sienne)
+        try:
+            if hasattr(obj, 'circuit_affectation') and obj.circuit_affectation:
+                return None
+        except:
+            pass
+        
+        # Ancien système
+        latest = obj.affectations.first()
+        return latest.action_requise if latest else None
+
+    def get_derniere_affectation_action_requise_display(self, obj):
+        """Retourne le libellé de l'action requise de la dernière affectation"""
+        # Pour les circuits, ne pas afficher d'action (chaque service peut avoir la sienne)
+        try:
+            if hasattr(obj, 'circuit_affectation') and obj.circuit_affectation:
+                return None
+        except:
+            pass
+        
+        # Ancien système
+        latest = obj.affectations.first()
+        return latest.get_action_requise_display() if latest else None
+
+    def get_a_circuit(self, obj):
+        """Retourne True si le courrier a un circuit d'affectation"""
+        try:
+            return hasattr(obj, 'circuit_affectation') and obj.circuit_affectation is not None
+        except:
+            return False
+
+    def get_nombre_affectations_circuit(self, obj):
+        """Retourne le nombre d'affectations de service dans le circuit"""
+        try:
+            if hasattr(obj, 'circuit_affectation') and obj.circuit_affectation:
+                return obj.circuit_affectation.affectations_service.count()
+            return 0
+        except:
+            return 0
+
+    def get_affectations_v2(self, obj):
+        """Retourne les affectations du circuit v2 si elles existent"""
+        try:
+            # Récupérer le circuit v2 (related_name='circuits_v2')
+            circuit = obj.circuits_v2.first()
+            if circuit:
+                # Récupérer toutes les affectations du circuit (related_name='affectations')
+                affectations = circuit.affectations.select_related(
+                    'destinataire', 'service'
+                ).all()
+                return AffectationV2SimpleSerializer(affectations, many=True).data
+            return []
+        except Exception as e:
+            # Log l'erreur mais ne pas casser la sérialisation
+            print(f"Erreur get_affectations_v2: {e}")
+            return []
 
 
 class CourrierCreateSerializer(serializers.ModelSerializer):
@@ -283,29 +558,34 @@ class CourrierCreateSerializer(serializers.ModelSerializer):
             'destinataire',
             'objet',
             'reference',
+            'reference_structure',
             'categorie',
             'service_concerne',
             'statut',
             'fichier',
-            'notes'
+            'notes',
+            'reponse_a',
+            'contenu_lettre',
         ]
     
     def validate(self, data):
         """
         Validation personnalisée pour s'assurer que:
         - Un courrier entrant a une date de réception
-        - Un courrier sortant a une date d'envoi
+        - Un courrier sortant a une date d'envoi (sauf brouillon)
         """
         type_courrier = data.get('type_courrier')
         date_reception = data.get('date_reception')
         date_envoi = data.get('date_envoi')
+        statut = data.get('statut', 'recu')
         
         if type_courrier == 'entrant' and not date_reception:
             raise serializers.ValidationError({
                 'date_reception': 'La date de réception est obligatoire pour un courrier entrant.'
             })
         
-        if type_courrier == 'sortant' and not date_envoi:
+        # Les brouillons sortants peuvent être enregistrés sans date d'envoi définitive
+        if type_courrier == 'sortant' and not date_envoi and statut != 'brouillon':
             raise serializers.ValidationError({
                 'date_envoi': "La date d'envoi est obligatoire pour un courrier sortant."
             })
@@ -317,6 +597,7 @@ class CourrierUpdateSerializer(serializers.ModelSerializer):
     """
     Serializer pour la mise à jour d'un courrier existant.
     Les champs essentiels peuvent être modifiés sauf le numéro de registre.
+    Le fichier peut également être remplacé.
     """
     class Meta:
         model = Courrier
@@ -328,10 +609,12 @@ class CourrierUpdateSerializer(serializers.ModelSerializer):
             'destinataire',
             'objet',
             'reference',
+            'reference_structure',
             'categorie',
             'service_concerne',
             'statut',
-            'notes'
+            'notes',
+            'fichier'
         ]
 
 
@@ -434,6 +717,12 @@ class AffectationCourrierSerializer(serializers.ModelSerializer):
     
     # Statut avec libellé
     statut_display = serializers.CharField(source='get_statut_display', read_only=True)
+
+    # Action requise avec libellé
+    action_requise_display = serializers.CharField(source='get_action_requise_display', read_only=True)
+
+    # Niveau d'urgence avec libellé
+    niveau_urgence_display = serializers.CharField(source='get_niveau_urgence_display', read_only=True)
     
     # Compteurs
     nb_commentaires = serializers.SerializerMethodField()
@@ -456,6 +745,11 @@ class AffectationCourrierSerializer(serializers.ModelSerializer):
             'note',
             'statut',
             'statut_display',
+            'action_requise',
+            'action_requise_display',
+            'niveau_urgence',
+            'niveau_urgence_display',
+            'date_echeance',
             'commentaire_traitement',
             'motif_rejet',
             'nb_commentaires',
@@ -542,3 +836,52 @@ class ServiceSimpleSerializer(serializers.ModelSerializer):
     def get_nb_utilisateurs(self, obj):
         """Retourne le nombre d'utilisateurs dans ce service"""
         return obj.utilisateurs.count()
+
+
+# ============================================================================
+# SERIALIZERS POUR LES LOGS D'ACTIONS (AUDIT)
+# ============================================================================
+
+class ActionLogSerializer(serializers.ModelSerializer):
+    """
+    Serializer pour les logs d'actions (journal d'audit)
+    """
+    action_type_display = serializers.CharField(source='get_action_type_display', read_only=True)
+    utilisateur_info = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = ActionLog
+        fields = [
+            'id',
+            'action_type',
+            'action_type_display',
+            'description',
+            'utilisateur',
+            'utilisateur_username',
+            'utilisateur_nom_complet',
+            'utilisateur_info',
+            'courrier',
+            'courrier_numero',
+            'document',
+            'document_nom',
+            'affectation',
+            'timestamp',
+            'ip_address',
+            'metadata',
+        ]
+        read_only_fields = [
+            'id',
+            'timestamp',
+            'utilisateur_username',
+            'utilisateur_nom_complet',
+            'courrier_numero',
+            'document_nom',
+        ]
+    
+    def get_utilisateur_info(self, obj):
+        """Retourne les infos de l'utilisateur en format compact"""
+        return {
+            'id': obj.utilisateur.id if obj.utilisateur else None,
+            'username': obj.utilisateur_username,
+            'nom_complet': obj.utilisateur_nom_complet,
+        }

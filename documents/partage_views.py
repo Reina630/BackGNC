@@ -45,12 +45,24 @@ class PartageLogViewSet(viewsets.ModelViewSet):
         'courrier', 
         'partage_par'
     ).all()
-    permission_classes = [IsAuthenticated, IsRHOrAdmin]
+    permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, rest_filters.SearchFilter, rest_filters.OrderingFilter]
     filterset_class = PartageFilter
     search_fields = ['destinataire', 'courrier__numero_registre', 'courrier__objet']
     ordering_fields = ['created_at', 'type_partage']
     ordering = ['-created_at']
+    
+    def get_queryset(self):
+        """
+        Filtrer les partages selon l'utilisateur :
+        - RH/Admin : tous les partages
+        - Autres : seulement leurs propres partages
+        """
+        user = self.request.user
+        if user.role in ['rh', 'admin']:
+            return PartageLog.objects.select_related('courrier', 'partage_par').all()
+        else:
+            return PartageLog.objects.filter(partage_par=user).select_related('courrier', 'partage_par')
     
     def get_serializer_class(self):
         """Utiliser le bon serializer selon l'action"""

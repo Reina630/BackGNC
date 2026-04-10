@@ -6,6 +6,7 @@ import cv2 as cv
 import numpy as np
 import base64
 import json
+import re
 
 
 def order_points(pts):
@@ -174,3 +175,187 @@ def warp_document(request):
             {'error': f'Erreur lors du traitement : {str(e)}'},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+
+
+def parse_french_document(text):
+    """Parse le texte d'un document administratif français pour extraire les champs clés."""
+    result = {
+        'objet': '',
+        'expediteur': '',
+        'destinataire': '',
+        'date_courrier': '',
+        'reference_structure': '',
+        'type_courrier': 'entrant',
+        'notes': '',
+    }
+
+    if not text:
+        return result
+
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+
+    # --- Date numérique ---
+    date_match = re.search(r'\b(\d{1,2})[/\-.](\d{1,2})[/\.\-](\d{4})\b', text)
+    if date_match:
+        d, m, y = date_match.groups()
+        try:
+            result['date_courrier'] = f"{y}-{m.zfill(2)}-{d.zfill(2)}"
+        except Exception:
+            pass
+    else:
+        # Date en lettres: "10 avril 2026"
+        mois_fr = {
+            'janvier': '01', 'fevrier': '02', 'février': '02', 'mars': '03',
+            'avril': '04', 'mai': '05', 'juin': '06', 'juillet': '07',
+            'aout': '08', 'août': '08', 'septembre': '09', 'octobre': '10',
+            'novembre': '11', 'decembre': '12', 'décembre': '12',
+        }
+        date_text_pat = r'\b(\d{1,2})\s+(' + '|'.join(mois_fr.keys()) + r')\s+(\d{4})\b'
+        m2 = re.search(date_text_pat, text.lower())
+        if m2:
+            d, m_str, y = m2.groups()
+            result['date_courrier'] = f"{y}-{mois_fr[m_str]}-{d.zfill(2)}"
+
+    # --- Objet ---
+    objet_m = re.search(
+        r'(?:Objet|OBJET|Sujet|SUJET|Concernant|Concerne|Re|V/Réf|V\.Réf)\s*[:\-]\s*(.+?)(?:\n|$)',
+        text, re.IGNORECASE
+    )
+    if objet_m:
+        result['objet'] = objet_m.group(1).strip()[:200]
+
+    # --- Référence ---
+    ref_m = re.search(
+        r'(?:Réf|Ref|REF|N°|No|Numéro|Référence)\s*[:\-.\s]\s*([A-Z0-9/\-\.]+)',
+        text, re.IGNORECASE
+    )
+    if ref_m:
+        result['reference_structure'] = ref_m.group(1).strip()[:100]
+
+    # --- Expéditeur ---
+    for pat in [
+        r'(?:De|Expéditeur|Emetteur|Expediteur)\s*[:\-]\s*(.+?)(?:\n|$)',
+        r'(?:De la part de|Par)\s*[:\-]\s*(.+?)(?:\n|$)',
+    ]:
+        exp_m = re.search(pat, text, re.IGNORECASE)
+        if exp_m:
+            result['expediteur'] = exp_m.group(1).strip()[:200]
+            break
+
+    # --- Destinataire ---
+    for pat in [
+        r'(?:À|A|Destinataire)\s*[:\-]\s*(.+?)(?:\n|$)',
+        r"(?:À l['']attention de|A l['']attention de)\s*(.+?)(?:\n|$)",
+        r'(?:Monsieur|Madame|M\.|Mme)\s+(?:le\s+)?(.+?)(?:\n|$)',
+    ]:
+        dest_m = re.search(pat, text, re.IGNORECASE)
+        if dest_m:
+            result['destinataire'] = dest_m.group(1).strip()[:200]
+            break
+
+    # --- Type courrier (heuristique) ---
+    sortant_kws = [
+        'nous vous informons', 'veuillez', 'je vous prie', 'nous vous prions',
+        'par la présente', 'je me permets', "nous avons l'honneur", 'suite à notre',
+    ]
+    if any(kw in text.lower() for kw in sortant_kws):
+        result['type_courrier'] = 'sortant'
+
+    # --- Notes (extrait du corps) ---
+    body_start = 0
+    for i, line in enumerate(lines):
+        if any(kw in line.lower() for kw in ['objet :', 'monsieur,', 'madame,', 'bonjour,']):
+            body_start = i + 1
+            break
+    excerpt = ' '.join(lines[body_start:body_start + 3])
+    result['notes'] = excerpt[:300]
+
+    return result
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def extract_document_info(request):
+    """
+    Extrait les informations d'un document (image ou PDF) via OCR (Tesseract).
+    Retourne les champs administratifs pour pré-remplir le formulaire d'archivage.
+    """
+    if 'file' not in request.FILES:
+        return Response({'error': 'Aucun fichier fourni'}, status=status.HTTP_400_BAD_REQUEST)
+
+    file = request.FILES['file']
+    file_name = (file.name or '').lower()
+    file_bytes = file.read()
+    extracted_text = ''
+    ocr_used = False
+
+    try:
+        if file_name.endswith('.pdf'):
+            # Essai 1 : extraction native (PDF numérique)
+            try:
+                import pdfplumber
+                import io as _io
+                with pdfplumber.open(_io.BytesIO(file_bytes)) as pdf:
+                    pages_text = []
+                    for page in pdf.pages[:5]:
+                        t = page.extract_text()
+                        if t:
+                            pages_text.append(t)
+                    extracted_text = '\n'.join(pages_text)
+            except ImportError:
+                pass
+
+            # Essai 2 : OCR sur PDF scanné
+            if not extracted_text.strip():
+                try:
+                    import pytesseract
+                    from PIL import Image
+                    from pdf2image import convert_from_bytes
+                    import io as _io
+                    images = convert_from_bytes(file_bytes, first_page=1, last_page=2, dpi=200)
+                    texts = []
+                    for img in images:
+                        texts.append(pytesseract.image_to_string(img, lang='fra+eng'))
+                    extracted_text = '\n'.join(texts)
+                    ocr_used = True
+                except ImportError:
+                    pass
+        else:
+            # Image : OCR direct
+            try:
+                import pytesseract
+                from PIL import Image
+                import io as _io
+                img = Image.open(_io.BytesIO(file_bytes))
+                if img.mode not in ('RGB', 'L'):
+                    img = img.convert('RGB')
+                extracted_text = pytesseract.image_to_string(img, lang='fra+eng')
+                ocr_used = True
+            except ImportError:
+                return Response({
+                    'fields': parse_french_document(''),
+                    'ocr_used': False,
+                    'text_length': 0,
+                    'warning': 'pytesseract non installé. Installez : pip install pytesseract Pillow',
+                })
+            except Exception as e:
+                return Response({
+                    'fields': parse_french_document(''),
+                    'ocr_used': False,
+                    'text_length': 0,
+                    'warning': f'Erreur OCR : {str(e)}',
+                })
+    except Exception as e:
+        return Response({
+            'fields': parse_french_document(''),
+            'ocr_used': False,
+            'text_length': 0,
+            'warning': str(e),
+        })
+
+    parsed = parse_french_document(extracted_text)
+    return Response({
+        'fields': parsed,
+        'ocr_used': ocr_used,
+        'text_length': len(extracted_text),
+    })

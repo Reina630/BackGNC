@@ -27,7 +27,7 @@ class IsAdminOrSelf(permissions.BasePermission):
 class IsRHOrAdmin(permissions.BasePermission):
     """
     Permission pour le registre de courrier.
-    Autorise uniquement les utilisateurs avec role='rh' ou role='admin'.
+    Autorise uniquement les utilisateurs avec role='rh', 'dg' ou role='admin'.
     Utilisé pour restreindre l'accès au système de gestion des courriers.
     """
     def has_permission(self, request, view):
@@ -35,5 +35,5 @@ class IsRHOrAdmin(permissions.BasePermission):
         if not request.user or not request.user.is_authenticated:
             return False
         
-        # Autoriser les admin et les RH
-        return request.user.role in ['admin', 'rh']
+        # Autoriser les admin, RH et DG
+        return request.user.role in ['admin', 'rh', 'dg']

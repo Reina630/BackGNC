@@ -20,6 +20,7 @@ class User(AbstractUser):
     ROLE_CHOICES = [
         ('admin', 'Admin'),
         ('rh', 'RH'),
+        ('dg', 'Directeur Général'),
         ('collaborator', 'Collaborateur'),
         ('client', 'Client'),
     ]

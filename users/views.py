@@ -107,9 +107,9 @@ def users_view(request):
     GET: Liste des utilisateurs (admin uniquement)
     POST: Créer un utilisateur (admin uniquement)
     """
-    # Vérifier si admin
-    if request.user.role != 'admin':
-        return Response({'error': 'Admin uniquement'}, status=status.HTTP_403_FORBIDDEN)
+    # Vérifier si admin ou RH
+    if request.user.role not in ['admin', 'rh']:
+        return Response({'error': 'Admin ou RH uniquement'}, status=status.HTTP_403_FORBIDDEN)
     
     if request.method == 'GET':
         users = User.objects.all().order_by('-date_joined')
@@ -133,9 +133,9 @@ def user_detail_view(request, pk):
     DELETE: Supprimer un utilisateur
     Admin uniquement
     """
-    # Vérifier si admin
-    if request.user.role != 'admin':
-        return Response({'error': 'Admin uniquement'}, status=status.HTTP_403_FORBIDDEN)
+    # Vérifier si admin ou RH
+    if request.user.role not in ['admin', 'rh']:
+        return Response({'error': 'Admin ou RH uniquement'}, status=status.HTTP_403_FORBIDDEN)
     
     try:
         user = User.objects.get(pk=pk)

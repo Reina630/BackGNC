@@ -60,6 +60,7 @@ INSTALLED_APPS = [
     'folders',
     'tags',
     'scan',
+    'affectations',
 ]
 
 MIDDLEWARE = [
