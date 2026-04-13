@@ -28,7 +28,7 @@ from rest_framework.response import Response
 from .filters import DocumentFilter
 from .models import (
     Document, DocumentVersion, DocumentShare, ShareRequest,
-    Courrier, PartageLog, Categorie, AffectationCourrier, CommentaireCourrier,
+    Courrier, PartageLog, Categorie,
     CourrierPieceJointe, ActionLog
 )
 from .serializer import (
@@ -41,8 +41,6 @@ from .serializer import (
     CourrierUpdateSerializer,
     
     CategorieSerializer,
-    AffectationCourrierSerializer,
-    CommentaireCourrierSerializer,
     ServiceSimpleSerializer
 )
 from users.models import User, Service
@@ -922,15 +920,33 @@ class CourrierViewSet(viewsets.ModelViewSet):
         if self.action in ['archives', 'restore']:
             return Courrier.objects.filter(is_deleted=True)
         
-        # Par défaut, on ne montre que les courriers non supprimés
-        queryset = Courrier.objects.filter(is_deleted=False).select_related(
-            'circuit_affectation'
+        # Pour les statistiques, on veut TOUS les courriers (y compris archivés) pour avoir des stats complètes
+        if self.action == 'statistiques':
+            queryset = Courrier.objects.filter(is_deleted=False).select_related(
+                'categorie',
+                'enregistre_par',
+                'courrier_parent',
+                'reponse_a',
+                'deleted_by'
+            ).prefetch_related(
+                'circuits_v2',
+                'circuits_v2__affectations',
+                'circuits_v2__affectations__destinataire',
+                'circuits_v2__affectations__service',
+                'affectations_v2',
+                'affectations_v2__destinataire',
+                'affectations_v2__service',
+            )
+            return queryset
+        
+        # Par défaut, on ne montre que les courriers non supprimés ET non archivés
+        queryset = Courrier.objects.filter(is_deleted=False).exclude(statut='archive').select_related(
+            'categorie',
+            'enregistre_par',
+            'courrier_parent',
+            'reponse_a',
+            'deleted_by'
         ).prefetch_related(
-            'circuit_affectation__affectations_service',
-            'circuit_affectation__affectations_service__service',
-            'affectations',
-            'affectations__utilisateur',
-            'affectations__utilisateur__service',
             'circuits_v2',
             'circuits_v2__affectations',
             'circuits_v2__affectations__destinataire',
@@ -945,11 +961,10 @@ class CourrierViewSet(viewsets.ModelViewSet):
             if user.role not in ['rh', 'admin']:
                 # Utilisateurs normaux voient :
                 # - Courriers de leur service (si service défini)
-                # - Courriers qui leur sont affectés (ancien système)
                 # - Courriers qui leur sont affectés (nouveau système v2)
                 # - Courriers qu'ils ont créés
                 from django.db.models import Q
-                filters = Q(enregistre_par=user) | Q(affectations__utilisateur=user) | Q(affectations_v2__destinataire=user)
+                filters = Q(enregistre_par=user) | Q(affectations_v2__destinataire=user)
                 if user.service:
                     filters |= Q(service_concerne=user.service)
                 queryset = queryset.filter(filters).distinct()
@@ -1117,23 +1132,15 @@ class CourrierViewSet(viewsets.ModelViewSet):
         from affectations.models import Affectation as AffectationV2
 
         # IDs de tous les courriers du queryset ayant ≥1 affectation active (non renvoyée/rejetée)
-        ids_avec_affectation_v2 = set(
+        ids_avec_affectation = set(
             AffectationV2.objects.filter(courrier__in=queryset)
             .exclude(statut__in=['renvoye', 'rejete'])
             .values_list('courrier_id', flat=True)
         )
-        ids_avec_affectation_v1 = set(
-            AffectationCourrier.objects.filter(courrier__in=queryset)
-            .values_list('courrier_id', flat=True)
-        )
-        ids_avec_affectation = ids_avec_affectation_v2 | ids_avec_affectation_v1
 
         # "En traitement" = courriers avec ≥1 affectation en_traitement
         ids_en_traitement = set(
             AffectationV2.objects.filter(courrier__in=queryset, statut='en_traitement')
-            .values_list('courrier_id', flat=True)
-        ) | set(
-            AffectationCourrier.objects.filter(courrier__in=queryset, statut='en_traitement')
             .values_list('courrier_id', flat=True)
         )
 
@@ -1457,14 +1464,6 @@ class CourrierViewSet(viewsets.ModelViewSet):
         # 4. urgent Items - format design (basé sur affectations critiques)
         from affectations.models import Affectation
         
-        # Combiner affectations de l'ancien et nouveau système
-        # Ancien système : AffectationCourrier avec niveau_urgence='critique'
-        affectations_critiques_old = AffectationCourrier.objects.filter(
-            niveau_urgence='critique'
-        ).exclude(
-            statut__in=['valide', 'signe']  # Exclure les affectations déjà traitées/signées
-        ).select_related('courrier', 'utilisateur').order_by('-date_affectation')
-        
         # Nouveau système : Affectation v2 avec niveau_urgence='critique' ou 'eleve'
         affectations_critiques_v2 = Affectation.objects.filter(
             niveau_urgence__in=['critique', 'eleve']
@@ -1473,31 +1472,6 @@ class CourrierViewSet(viewsets.ModelViewSet):
         ).select_related('courrier', 'destinataire', 'service').order_by('-date_affectation')
         
         stats['urgentItems'] = []
-        
-        # Ajouter affectations de l'ancien système
-        for affectation in affectations_critiques_old:
-            # Calculer le temps écoulé depuis l'affectation
-            temps_ecoule = now - affectation.date_affectation
-            if temps_ecoule.days > 0:
-                temps_str = f"{temps_ecoule.days}j"
-            else:
-                heures = temps_ecoule.seconds // 3600
-                temps_str = f"{heures}h"
-            
-            # Créer le subtitle avec le statut et l'utilisateur
-            subtitle = f"Affecté à {affectation.utilisateur.get_full_name() or affectation.utilisateur.username} · {temps_str}"
-            
-            stats['urgentItems'].append({
-                'id': affectation.courrier.id,
-                'affectation_id': affectation.id,
-                'title': affectation.courrier.objet[:60] if affectation.courrier.objet else 'Sans objet',
-                'subtitle': subtitle,
-                'department': dict(Courrier.SERVICE_CHOICES).get(affectation.courrier.service_concerne, 'Non défini'),
-                'numero_registre': affectation.courrier.numero_registre,
-                'statut_affectation': affectation.get_statut_display(),
-                'niveau_urgence': affectation.get_niveau_urgence_display(),
-                'status': 'critique'
-            })
         
         # Ajouter affectations du nouveau système v2
         for affectation in affectations_critiques_v2:
@@ -1885,8 +1859,8 @@ class CourrierViewSet(viewsets.ModelViewSet):
         if nouveau_statut == 'traite' and ancien_statut != 'traite':
             from users.utils import creer_notification
             
-            # Récupérer tous ceux qui ont affecté ce courrier
-            affecteurs = courrier.affectations.filter(affecte_par__isnull=False).values_list('affecte_par', flat=True).distinct()
+            # Récupérer tous ceux qui ont affecté ce courrier (nouveau système v2)
+            affecteurs = courrier.affectations_v2.filter(affecte_par__isnull=False).values_list('affecte_par', flat=True).distinct()
             
             for affecteur_id in affecteurs:
                 try:
@@ -2153,19 +2127,7 @@ class CourrierViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
     
-    @action(detail=False, methods=['get'])
-    def mes_affectations(self, request):
-        """
-        Récupérer les affectations de courriers pour l'utilisateur connecté.
-        URL : GET /api/courriers/mes_affectations/
-        """
-        affectations = AffectationCourrier.objects.filter(
-            utilisateur=request.user
-        ).select_related('courrier', 'affecte_par').order_by('-date_affectation')
-        
-        serializer = AffectationCourrierSerializer(affectations, many=True)
-        return Response(serializer.data)
-    
+
     @action(detail=False, methods=['get'])
     def mes_courriers(self, request):
         """
@@ -2540,13 +2502,6 @@ def appliquer_signature_pdf(pdf_path, signature_path, position_x, position_y, la
     output_stream.seek(0)
     
     return output_stream
-
-
-# ============================================================================
-# VIEWSETS POUR LES AFFECTATIONS DE COURRIERS
-# ============================================================================
-
-class AffectationCourrierViewSet(viewsets.ModelViewSet):
     """
     ViewSet pour gérer les affectations de courriers.
     

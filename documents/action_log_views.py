@@ -28,8 +28,7 @@ class ActionLogViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = ActionLog.objects.select_related(
         'utilisateur',
         'courrier',
-        'document',
-        'affectation'
+        'document'
     ).all()
     serializer_class = ActionLogSerializer
     permission_classes = [IsAuthenticated]
@@ -47,7 +46,7 @@ class ActionLogViewSet(viewsets.ReadOnlyModelViewSet):
         """
         user = self.request.user
         if user.role in ['rh', 'admin']:
-            return ActionLog.objects.select_related('utilisateur', 'courrier', 'document', 'affectation').all()
+            return ActionLog.objects.select_related('utilisateur', 'courrier', 'document').all()
         else:
             # Voir :
             # - Ses propres actions
@@ -64,7 +63,7 @@ class ActionLogViewSet(viewsets.ReadOnlyModelViewSet):
                 filters |= Q(courrier__service_destinataire=user.service.nom) | Q(courrier__service_emetteur=user.service.nom)
             
             return ActionLog.objects.filter(filters).select_related(
-                'utilisateur', 'courrier', 'document', 'affectation'
+                'utilisateur', 'courrier', 'document'
             ).distinct()
     
     @action(detail=False, methods=['get'])

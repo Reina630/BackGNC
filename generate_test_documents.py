@@ -1,48 +1,42 @@
 """
-Script pour générer des exemples de courriers pour Iman (agence de communication digitale au Niger)
-Génère environ une dizaine de courriers clients et fournisseurs typiques
+Script pour générer des courriers réalistes pour le système de gestion de courriers (GED).
+Génère des courriers entrants et sortants avec toutes les informations nécessaires pour l'archivage.
+
+Usage:
+    python generate_test_documents.py
+
+Ce script crée des courriers de test dans le dossier media/courriers/test/
+avec des PDFs réalistes contenant toutes les métadonnées nécessaires.
 """
 import os
+import sys
+import django
 from pathlib import Path
 from datetime import datetime, timedelta
 import random
 
+# Configuration Django
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'ged.settings')
+django.setup()
+
+# Imports Django après setup
+from django.core.files import File
+from documents.models import Courrier, Categorie
+from users.models import User
+from django.utils import timezone
+
 # Pour générer des PDF
 try:
     from reportlab.pdfgen import canvas
-    from reportlab.lib.pagesizes import letter, A4
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import cm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
     REPORTLAB_AVAILABLE = True
 except ImportError:
     REPORTLAB_AVAILABLE = False
-    print("⚠️  reportlab non installé - les PDF seront des fichiers vides")
+    print("⚠️  reportlab non installé - les PDF ne seront pas générés")
     print("   Installez avec: pip install reportlab")
-
-# Pour générer des fichiers Office
-try:
-    from docx import Document
-    from docx.shared import Inches
-    PYTHON_DOCX_AVAILABLE = True
-except ImportError:
-    PYTHON_DOCX_AVAILABLE = False
-    print("⚠️  python-docx non installé - les DOCX seront des fichiers vides")
-    print("   Installez avec: pip install python-docx")
-
-try:
-    from openpyxl import Workbook
-    OPENPYXL_AVAILABLE = True
-except ImportError:
-    OPENPYXL_AVAILABLE = False
-    print("⚠️  openpyxl non installé - les XLSX seront des fichiers vides")
-    print("   Installez avec: pip install openpyxl")
-
-# Pour générer des images
-try:
-    from PIL import Image, ImageDraw, ImageFont
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
-    print("⚠️  Pillow non installé - les images seront des fichiers vides")
-    print("   Installez avec: pip install Pillow")
 
 
 def create_test_folder(base_path="test_documents"):

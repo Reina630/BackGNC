@@ -217,41 +217,97 @@ def parse_french_document(text):
             result['date_courrier'] = f"{y}-{mois_fr[m_str]}-{d.zfill(2)}"
 
     # --- Objet ---
+    # Amélioration: capturer l'objet sur plusieurs lignes potentielles
+    # Chercher "Objet:" ou équivalents, puis capturer jusqu'à 2-3 lignes
     objet_m = re.search(
-        r'(?:Objet|OBJET|Sujet|SUJET|Concernant|Concerne|Re|V/Réf|V\.Réf)\s*[:\-]\s*(.+?)(?:\n|$)',
-        text, re.IGNORECASE
+        r'(?:Objet|OBJET|Sujet|SUJET|Concernant|Concerne|Object)\s*[:\-]?\s*(.+?)(?=\n\s*(?:De|À|Date|Réf|Expediteur|Destinataire|$))',
+        text, re.IGNORECASE | re.DOTALL
     )
     if objet_m:
-        result['objet'] = objet_m.group(1).strip()[:200]
+        obj = objet_m.group(1).strip()
+        # Nettoyer les caractères parasites OCR et retours à la ligne multiples
+        obj = re.sub(r'\s+', ' ', obj)
+        # Enlever les tirets en début si présents
+        obj = obj.lstrip('—-–').strip()
+        result['objet'] = obj[:200]
+    
+    # Si pas trouvé avec le pattern principal, essayer un pattern plus permissif
+    if not result['objet']:
+        # Chercher une ligne qui commence par "Objet" avec ou sans ":"
+        for line in lines:
+            if re.match(r'^\s*(?:Objet|OBJET|Sujet|SUJET)', line, re.IGNORECASE):
+                # Extraire tout ce qui suit "Objet:"
+                parts = re.split(r'(?:Objet|OBJET|Sujet|SUJET)\s*[:\-]?\s*', line, maxsplit=1, flags=re.IGNORECASE)
+                if len(parts) > 1:
+                    obj = parts[1].strip()
+                    obj = re.sub(r'\s+', ' ', obj)
+                    obj = obj.lstrip('—-–').strip()
+                    if obj and len(obj) > 3:  # Au moins 3 caractères
+                        result['objet'] = obj[:200]
+                        break
 
     # --- Référence ---
-    ref_m = re.search(
-        r'(?:Réf|Ref|REF|N°|No|Numéro|Référence)\s*[:\-.\s]\s*([A-Z0-9/\-\.]+)',
-        text, re.IGNORECASE
-    )
-    if ref_m:
-        result['reference_structure'] = ref_m.group(1).strip()[:100]
+    # Pattern amélioré pour capturer les références avec différents formats
+    # Exemples: Réf.: SONIDEP/DSI/2026/0156, N°: 2026-001, REF-2026-123, Réf : ABC123
+    # FACTURE N° IMAN/FACT/2026/0112
+    ref_patterns = [
+        # Pattern pour FACTURE N° suivi de la référence
+        r'(?:FACTURE|Facture)\s+(?:N°|No)\s*[:\-\s]*([A-Z0-9/\-\.]+(?:[/\-][A-Z0-9]+)*)',
+        # Pattern principal avec séparateurs variés
+        r'(?:Réf\.?|Ref\.?|REF\.?|N°|No\.?|Numéro|Référence)\s*[:\-.\s]+\s*([A-Z0-9/\-\.]+(?:[/\-][A-Z0-9]+)*)',
+        # Pattern alternatif pour "Réf:" suivi de la référence
+        r'(?:Réf\.?|Ref\.?|REF\.?)\s*:\s*([A-Z][A-Z0-9/\-\.]+(?:[/\-][A-Z0-9]+)*)',
+        # Pattern pour numéros simples
+        r'(?:N°|No\.?|Numéro)\s*[:\-\s]*([A-Z0-9]{3,}[A-Z0-9/\-\.]*)',
+    ]
+    
+    for pattern in ref_patterns:
+        ref_m = re.search(pattern, text, re.IGNORECASE)
+        if ref_m:
+            # Nettoyer la référence capturée
+            ref = ref_m.group(1).strip()
+            # Enlever les espaces internes
+            ref = re.sub(r'\s+', '', ref)
+            # Couper au premier mot non-référence (Date, Objet, etc.)
+            ref = re.split(r'(?:Date|Objet|Sujet|Expediteur|De|À)', ref, maxsplit=1)[0]
+            if len(ref) >= 3:  # Au moins 3 caractères
+                result['reference_structure'] = ref[:100]
+                break
 
     # --- Expéditeur ---
+    # Essayer plusieurs patterns avec des variantes OCR
     for pat in [
-        r'(?:De|Expéditeur|Emetteur|Expediteur)\s*[:\-]\s*(.+?)(?:\n|$)',
-        r'(?:De la part de|Par)\s*[:\-]\s*(.+?)(?:\n|$)',
+        r'(?:De\s*:|Expéditeur\s*:|Emetteur\s*:|Expediteur\s*:)\s*(.+?)(?=\n\s*(?:À|A\s|Destinataire|Date|Réf|NIF|Objet|$))',
+        r'(?:De la part de|Par)\s*[:\-]?\s*(.+?)(?=\n|$)',
+        r'De\s*:\s*(.+?)(?=\n\s*(?:À|A\s|Destinataire|Date|$))',
     ]:
-        exp_m = re.search(pat, text, re.IGNORECASE)
+        exp_m = re.search(pat, text, re.IGNORECASE | re.DOTALL)
         if exp_m:
-            result['expediteur'] = exp_m.group(1).strip()[:200]
-            break
+            exp = exp_m.group(1).strip()
+            # Nettoyer les espaces multiples et retours à la ligne
+            exp = re.sub(r'\s+', ' ', exp)
+            # Enlever les tirets en début
+            exp = exp.lstrip('—-–').strip()
+            if exp and len(exp) > 2:
+                result['expediteur'] = exp[:200]
+                break
 
     # --- Destinataire ---
     for pat in [
-        r'(?:À|A|Destinataire)\s*[:\-]\s*(.+?)(?:\n|$)',
-        r"(?:À l['']attention de|A l['']attention de)\s*(.+?)(?:\n|$)",
-        r'(?:Monsieur|Madame|M\.|Mme)\s+(?:le\s+)?(.+?)(?:\n|$)',
+        r'(?:À\s*:|A\s*:|Destinataire\s*:)\s*(.+?)(?=\n\s*(?:Réf|Date|Objet|NIF|De\s|$))',
+        r"(?:À l['']attention de|A l['']attention de)\s*[:\-]?\s*(.+?)(?=\n|$)",
+        r'À\s*:\s*(.+?)(?=\n\s*(?:Réf|Date|Objet|$))',
     ]:
-        dest_m = re.search(pat, text, re.IGNORECASE)
+        dest_m = re.search(pat, text, re.IGNORECASE | re.DOTALL)
         if dest_m:
-            result['destinataire'] = dest_m.group(1).strip()[:200]
-            break
+            dest = dest_m.group(1).strip()
+            # Nettoyer les espaces multiples et retours à la ligne
+            dest = re.sub(r'\s+', ' ', dest)
+            # Enlever les tirets en début
+            dest = dest.lstrip('—-–').strip()
+            if dest and len(dest) > 2:
+                result['destinataire'] = dest[:200]
+                break
 
     # --- Type courrier (heuristique) ---
     sortant_kws = [
@@ -358,4 +414,5 @@ def extract_document_info(request):
         'fields': parsed,
         'ocr_used': ocr_used,
         'text_length': len(extracted_text),
+        'extracted_text': extracted_text[:500] if extracted_text else '',  # Pour debug
     })
