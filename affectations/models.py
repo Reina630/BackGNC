@@ -120,7 +120,7 @@ class Circuit(models.Model):
             self.save(update_fields=['statut', 'date_modification'])
             # Mettre à jour le courrier si toutes ses affectations sont traitées
             tous_circuits_termines = all(
-                c.est_termine() for c in self.courrier.circuits.all()
+                c.est_termine() for c in self.courrier.circuits_v2.all()
             )
             if tous_circuits_termines:
                 self.courrier.statut = 'traite'
@@ -324,8 +324,15 @@ class Affectation(models.Model):
         if self.statut in ('distribue',):
             if not self.date_lecture:
                 self.date_lecture = timezone.now()
-            self.statut = 'vu'
-            self.save(update_fields=['statut', 'date_lecture'])
+            # Pour les courriers informatifs, la lecture vaut traitement
+            if self.action_requise == 'informatif':
+                self._set_date_traitement()
+                self.statut = 'valide'
+                self.save(update_fields=['statut', 'date_lecture', 'date_traitement'])
+                self.circuit.rafraichir_statut()
+            else:
+                self.statut = 'vu'
+                self.save(update_fields=['statut', 'date_lecture'])
 
     def demarrer_traitement(self):
         """Passe de 'vu' à 'en_traitement'."""

@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
-from .models import User, Service, Log, Notification
+from .models import User, Service, Notification
 
 
 @admin.register(Service)
@@ -31,14 +31,6 @@ class UserAdmin(BaseUserAdmin):
             'fields': ('role', 'service'),
         }),
     )
-
-
-@admin.register(Log)
-class LogAdmin(admin.ModelAdmin):
-    list_display = ['timestamp', 'user', 'action']
-    list_filter = ['timestamp']
-    search_fields = ['user__username', 'action']
-    readonly_fields = ['timestamp']
 
 
 @admin.register(Notification)

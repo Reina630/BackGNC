@@ -15,6 +15,8 @@ from .views import (
     marquer_notification_lue_view,
     marquer_toutes_lues_view,
     supprimer_notification_view,
+    alertes_view,
+    dismisser_alerte_view,
 )
 
 urlpatterns = [
@@ -44,4 +46,8 @@ urlpatterns = [
     path('notifications/<int:pk>/lue/', marquer_notification_lue_view, name='marquer_notification_lue'),
     path('notifications/marquer-toutes-lues/', marquer_toutes_lues_view, name='marquer_toutes_lues'),
     path('notifications/<int:pk>/', supprimer_notification_view, name='supprimer_notification'),
+
+    # Alertes urgentes (bannière dashboard)
+    path('alertes/', alertes_view, name='alertes'),
+    path('alertes/<int:pk>/dismiss/', dismisser_alerte_view, name='dismisser_alerte'),
 ]

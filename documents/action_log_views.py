@@ -28,7 +28,6 @@ class ActionLogViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = ActionLog.objects.select_related(
         'utilisateur',
         'courrier',
-        'document'
     ).all()
     serializer_class = ActionLogSerializer
     permission_classes = [IsAuthenticated]
@@ -46,14 +45,13 @@ class ActionLogViewSet(viewsets.ReadOnlyModelViewSet):
         """
         user = self.request.user
         if user.role in ['rh', 'admin']:
-            return ActionLog.objects.select_related('utilisateur', 'courrier', 'document').all()
+            return ActionLog.objects.select_related('utilisateur', 'courrier').all()
         else:
             # Voir :
             # - Ses propres actions
             # - Actions sur courriers qui lui sont affectés (via circuits v2)
             # - Actions sur courriers de son service (via service_destinataire)
-            # - Actions sur documents qu'il possède
-            filters = Q(utilisateur=user) | Q(document__owner=user)
+            filters = Q(utilisateur=user)
             
             # Courriers affectés via le nouveau système de circuits
             filters |= Q(courrier__circuits_v2__affectations__destinataire=user)
@@ -63,7 +61,7 @@ class ActionLogViewSet(viewsets.ReadOnlyModelViewSet):
                 filters |= Q(courrier__service_destinataire=user.service.nom) | Q(courrier__service_emetteur=user.service.nom)
             
             return ActionLog.objects.filter(filters).select_related(
-                'utilisateur', 'courrier', 'document'
+                'utilisateur', 'courrier'
             ).distinct()
     
     @action(detail=False, methods=['get'])

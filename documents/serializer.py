@@ -1,11 +1,9 @@
 from rest_framework import serializers
 from .models import (
-    Document, DocumentVersion, DocumentShare, ShareRequest, 
     Courrier, PartageLog, Categorie,
     CourrierPieceJointe, ActionLog
 )
 from users.models import User, Service
-from tags.serializers import TagSerializer
 
 
 # ============================================================================
@@ -26,78 +24,6 @@ class CategorieSerializer(serializers.ModelSerializer):
     def get_courriers_count(self, obj):
         """Retourne le nombre de courriers dans cette catégorie"""
         return obj.courriers.count()
-
-
-class DocumentShareSerializer(serializers.ModelSerializer):
-    shared_with_username = serializers.ReadOnlyField(source='shared_with.username')
-    shared_with_email = serializers.ReadOnlyField(source='shared_with.email')
-    shared_by_username = serializers.ReadOnlyField(source='shared_by.username')
-    
-    class Meta:
-        model = DocumentShare
-        fields = ['id', 'document', 'shared_with', 'shared_with_username', 'shared_with_email', 
-                  'shared_by', 'shared_by_username', 'permission', 'shared_at']
-        read_only_fields = ['shared_by', 'shared_at']
-
-
-class ShareRequestSerializer(serializers.ModelSerializer):
-    requested_by_username = serializers.ReadOnlyField(source='requested_by.username')
-    requested_by_email = serializers.ReadOnlyField(source='requested_by.email')
-    reviewed_by_username = serializers.ReadOnlyField(source='reviewed_by.username')
-    document_title = serializers.ReadOnlyField(source='document.title')
-    document_owner = serializers.ReadOnlyField(source='document.owner.username')
-    document_owner_id = serializers.ReadOnlyField(source='document.owner.id')
-    
-    class Meta:
-        model = ShareRequest
-        fields = ['id', 'document', 'document_title', 'document_owner', 'document_owner_id',
-                  'requested_by', 'requested_by_username', 'requested_by_email',
-                  'requested_permission', 'status', 'message', 'rejection_count',
-                  'created_at', 'reviewed_at', 'reviewed_by', 'reviewed_by_username']
-        read_only_fields = ['requested_by', 'created_at', 'reviewed_at', 'reviewed_by', 'rejection_count']
-
-
-class DocumentSerializer(serializers.ModelSerializer):
-    owner_name = serializers.ReadOnlyField(source='owner.username') # Pour afficher le nom au lieu de l'ID
-    folder_name = serializers.ReadOnlyField(source='folder.name') # Pour afficher le nom du dossier
-    tag_list = TagSerializer(source='tags', many=True, read_only=True)  # Afficher les détails des tags
-    shares = DocumentShareSerializer(many=True, read_only=True)
-    shared_with_count = serializers.SerializerMethodField()
-    has_access = serializers.SerializerMethodField()
-    has_pending_request = serializers.SerializerMethodField()
-    access_request_status = serializers.SerializerMethodField()
-    access_request_rejection_count = serializers.SerializerMethodField()
-    
-    class Meta:
-        model = Document
-        fields = '__all__'
-        read_only_fields = ('owner', 'created_at', 'updated_at')
-    
-    def get_shared_with_count(self, obj):
-        """Retourne le nombre d'utilisateurs avec qui le document est partagé"""
-        return obj.shares.count()
-    
-    def get_has_access(self, obj):
-        """Indique si l'utilisateur actuel a accès au document"""
-        request = self.context.get('request')
-        if not request or not request.user:
-            return False
-        
-        user = request.user
-        # L'utilisateur a accès si:
-        # - Il est propriétaire
-        # - Il est administrateur
-        # - Le document est public
-        # - Le document est partagé avec lui
-        return (
-            obj.owner == user or 
-            user.role == 'admin' or
-            obj.visibility == 'public' or 
-            obj.shares.filter(shared_with=user).exists()
-        )
-    
-    def get_has_pending_request(self, obj):
-        """Indique si l'utilisateur a déjà une demande d'accès en attente pour ce document"""
         request = self.context.get('request')
         if not request or not request.user:
             return False
@@ -619,8 +545,6 @@ class ActionLogSerializer(serializers.ModelSerializer):
             'utilisateur_info',
             'courrier',
             'courrier_numero',
-            'document',
-            'document_nom',
             'timestamp',
             'ip_address',
             'metadata',
@@ -631,7 +555,6 @@ class ActionLogSerializer(serializers.ModelSerializer):
             'utilisateur_username',
             'utilisateur_nom_complet',
             'courrier_numero',
-            'document_nom',
         ]
     
     def get_utilisateur_info(self, obj):

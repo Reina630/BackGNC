@@ -23,10 +23,8 @@ from django.urls import path, include
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/users/', include('users.urls')),
-    path('api/affectations/', include('affectations.urls')),  # AVANT le catch-all api/
-    path('api/', include('folders.urls')),
+    path('api/affectations/', include('affectations.urls')),
     path('api/', include('documents.urls')),
-    path('api/', include('tags.urls')),
     path('api/scan/', include('scan.urls')),
 ]
 # On ajoute le service des fichiers média seulement en mode DEBUG (développement)

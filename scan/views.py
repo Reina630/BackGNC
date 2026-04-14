@@ -178,7 +178,11 @@ def warp_document(request):
 
 
 def parse_french_document(text):
-    """Parse le texte d'un document administratif français pour extraire les champs clés."""
+    """
+    Extrait les champs clés d'un document administratif français.
+    Stratégie : marqueurs explicites en priorité, puis heuristiques positionnelles.
+    Champs extraits : date, objet, expéditeur, destinataire, référence, type.
+    """
     result = {
         'objet': '',
         'expediteur': '',
@@ -193,140 +197,180 @@ def parse_french_document(text):
         return result
 
     lines = [l.strip() for l in text.split('\n') if l.strip()]
+    full = '\n'.join(lines)
 
-    # --- Date numérique ---
-    date_match = re.search(r'\b(\d{1,2})[/\-.](\d{1,2})[/\.\-](\d{4})\b', text)
-    if date_match:
-        d, m, y = date_match.groups()
+    # Labels de champs connus — servent à délimiter les blocs
+    FIELD_LABEL = re.compile(
+        r'^\s*(?:De|À|A|Objet|Réf|Ref|REF|Date|Expéditeur|Emetteur|Destinataire|'
+        r'N°|No|Copie|Tel|Tél|Fax|Email|Service|Direction|Signat)',
+        re.IGNORECASE,
+    )
+
+    # ── 1. DATE ──────────────────────────────────────────────────────────────
+    mois_fr = {
+        'janvier': '01', 'fevrier': '02', 'février': '02', 'mars': '03',
+        'avril': '04', 'mai': '05', 'juin': '06', 'juillet': '07',
+        'aout': '08', 'août': '08', 'septembre': '09', 'octobre': '10',
+        'novembre': '11', 'decembre': '12', 'décembre': '12',
+    }
+    mois_pat = '|'.join(mois_fr.keys())
+
+    def _parse_date(match, fmt):
         try:
-            result['date_courrier'] = f"{y}-{m.zfill(2)}-{d.zfill(2)}"
+            if fmt == 'text':
+                d, m_str, y = match.group(1), match.group(2).lower(), match.group(3)
+                return f"{y}-{mois_fr[m_str]}-{d.zfill(2)}"
+            else:
+                d, m, y = match.group(1), match.group(2), match.group(3)
+                if 1 <= int(d) <= 31 and 1 <= int(m) <= 12:
+                    return f"{y}-{m.zfill(2)}-{d.zfill(2)}"
         except Exception:
             pass
-    else:
-        # Date en lettres: "10 avril 2026"
-        mois_fr = {
-            'janvier': '01', 'fevrier': '02', 'février': '02', 'mars': '03',
-            'avril': '04', 'mai': '05', 'juin': '06', 'juillet': '07',
-            'aout': '08', 'août': '08', 'septembre': '09', 'octobre': '10',
-            'novembre': '11', 'decembre': '12', 'décembre': '12',
-        }
-        date_text_pat = r'\b(\d{1,2})\s+(' + '|'.join(mois_fr.keys()) + r')\s+(\d{4})\b'
-        m2 = re.search(date_text_pat, text.lower())
-        if m2:
-            d, m_str, y = m2.groups()
-            result['date_courrier'] = f"{y}-{mois_fr[m_str]}-{d.zfill(2)}"
+        return ''
 
-    # --- Objet ---
-    # Amélioration: capturer l'objet sur plusieurs lignes potentielles
-    # Chercher "Objet:" ou équivalents, puis capturer jusqu'à 2-3 lignes
-    objet_m = re.search(
-        r'(?:Objet|OBJET|Sujet|SUJET|Concernant|Concerne|Object)\s*[:\-]?\s*(.+?)(?=\n\s*(?:De|À|Date|Réf|Expediteur|Destinataire|$))',
-        text, re.IGNORECASE | re.DOTALL
-    )
-    if objet_m:
-        obj = objet_m.group(1).strip()
-        # Nettoyer les caractères parasites OCR et retours à la ligne multiples
-        obj = re.sub(r'\s+', ' ', obj)
-        # Enlever les tirets en début si présents
-        obj = obj.lstrip('—-–').strip()
-        result['objet'] = obj[:200]
-    
-    # Si pas trouvé avec le pattern principal, essayer un pattern plus permissif
-    if not result['objet']:
-        # Chercher une ligne qui commence par "Objet" avec ou sans ":"
-        for line in lines:
-            if re.match(r'^\s*(?:Objet|OBJET|Sujet|SUJET)', line, re.IGNORECASE):
-                # Extraire tout ce qui suit "Objet:"
-                parts = re.split(r'(?:Objet|OBJET|Sujet|SUJET)\s*[:\-]?\s*', line, maxsplit=1, flags=re.IGNORECASE)
-                if len(parts) > 1:
-                    obj = parts[1].strip()
-                    obj = re.sub(r'\s+', ' ', obj)
-                    obj = obj.lstrip('—-–').strip()
-                    if obj and len(obj) > 3:  # Au moins 3 caractères
-                        result['objet'] = obj[:200]
-                        break
-
-    # --- Référence ---
-    # Pattern amélioré pour capturer les références avec différents formats
-    # Exemples: Réf.: SONIDEP/DSI/2026/0156, N°: 2026-001, REF-2026-123, Réf : ABC123
-    # FACTURE N° IMAN/FACT/2026/0112
-    ref_patterns = [
-        # Pattern pour FACTURE N° suivi de la référence
-        r'(?:FACTURE|Facture)\s+(?:N°|No)\s*[:\-\s]*([A-Z0-9/\-\.]+(?:[/\-][A-Z0-9]+)*)',
-        # Pattern principal avec séparateurs variés
-        r'(?:Réf\.?|Ref\.?|REF\.?|N°|No\.?|Numéro|Référence)\s*[:\-.\s]+\s*([A-Z0-9/\-\.]+(?:[/\-][A-Z0-9]+)*)',
-        # Pattern alternatif pour "Réf:" suivi de la référence
-        r'(?:Réf\.?|Ref\.?|REF\.?)\s*:\s*([A-Z][A-Z0-9/\-\.]+(?:[/\-][A-Z0-9]+)*)',
-        # Pattern pour numéros simples
-        r'(?:N°|No\.?|Numéro)\s*[:\-\s]*([A-Z0-9]{3,}[A-Z0-9/\-\.]*)',
+    # Priorité : date textuelle labelisée > date textuelle brute > numérique labelisée > numérique brute
+    date_candidates = [
+        (re.search(r'(?:Le\s+|le\s+|Date\s*[:\-]\s*)(\d{1,2})\s+(' + mois_pat + r')\s+(\d{4})\b', full, re.IGNORECASE), 'text'),
+        (re.search(r'\b(\d{1,2})\s+(' + mois_pat + r')\s+(\d{4})\b', full, re.IGNORECASE), 'text'),
+        (re.search(r'(?:Le\s+|Date\s*[:\-]\s*)(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})', full), 'numeric'),
+        (re.search(r'\b(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})\b', full), 'numeric'),
     ]
-    
-    for pattern in ref_patterns:
-        ref_m = re.search(pattern, text, re.IGNORECASE)
-        if ref_m:
-            # Nettoyer la référence capturée
-            ref = ref_m.group(1).strip()
-            # Enlever les espaces internes
-            ref = re.sub(r'\s+', '', ref)
-            # Couper au premier mot non-référence (Date, Objet, etc.)
-            ref = re.split(r'(?:Date|Objet|Sujet|Expediteur|De|À)', ref, maxsplit=1)[0]
-            if len(ref) >= 3:  # Au moins 3 caractères
-                result['reference_structure'] = ref[:100]
+    for m_obj, fmt in date_candidates:
+        if m_obj:
+            parsed = _parse_date(m_obj, fmt)
+            if parsed:
+                result['date_courrier'] = parsed
                 break
 
-    # --- Expéditeur ---
-    # Essayer plusieurs patterns avec des variantes OCR
+    # ── 2. OBJET (multi-lignes) ───────────────────────────────────────────────
+    objet_lines = []
+    in_objet = False
+    for line in lines:
+        if re.match(r'^\s*(?:Objet|OBJET|Object|Sujet|SUJET)\s*[:\-]?\s*', line, re.IGNORECASE):
+            in_objet = True
+            # Contenu de la même ligne après "Objet :"
+            after = re.split(r'(?:Objet|OBJET|Object|Sujet|SUJET)\s*[:\-]?\s*', line, maxsplit=1, flags=re.IGNORECASE)
+            if len(after) > 1 and after[1].strip():
+                objet_lines.append(after[1].strip())
+            continue
+        if in_objet:
+            # Stopper sur un autre champ ou ligne vide ou trop courte
+            if FIELD_LABEL.match(line) or len(line) < 3:
+                break
+            objet_lines.append(line)
+            if len(objet_lines) >= 4:
+                break
+    if objet_lines:
+        raw = ' '.join(objet_lines)
+        result['objet'] = re.sub(r'\s+', ' ', raw).strip('—-– ')[:300]
+
+    # Fallback : regex simple sur une ligne
+    if not result['objet']:
+        m = re.search(r'(?:Objet|OBJET|Sujet)\s*[:\-]\s*(.+?)(?:\n|$)', full, re.IGNORECASE)
+        if m:
+            result['objet'] = re.sub(r'\s+', ' ', m.group(1)).strip()[:300]
+
+    # ── 3. RÉFÉRENCE ─────────────────────────────────────────────────────────
     for pat in [
-        r'(?:De\s*:|Expéditeur\s*:|Emetteur\s*:|Expediteur\s*:)\s*(.+?)(?=\n\s*(?:À|A\s|Destinataire|Date|Réf|NIF|Objet|$))',
-        r'(?:De la part de|Par)\s*[:\-]?\s*(.+?)(?=\n|$)',
-        r'De\s*:\s*(.+?)(?=\n\s*(?:À|A\s|Destinataire|Date|$))',
+        r'(?:Réf\.?|Ref\.?|REF\.?)\s*[:\-\.]\s*([A-Z0-9][A-Z0-9/\-\.]{2,})',
+        r'N°\s*[:\-]?\s*([A-Z0-9][A-Z0-9/\-\.]{2,})',
+        r'(?:FACTURE|Facture)\s+(?:N°|No)\s*[:\-\s]*([A-Z0-9][A-Z0-9/\-\.]+)',
     ]:
-        exp_m = re.search(pat, text, re.IGNORECASE | re.DOTALL)
-        if exp_m:
-            exp = exp_m.group(1).strip()
-            # Nettoyer les espaces multiples et retours à la ligne
-            exp = re.sub(r'\s+', ' ', exp)
-            # Enlever les tirets en début
-            exp = exp.lstrip('—-–').strip()
-            if exp and len(exp) > 2:
+        m = re.search(pat, full, re.IGNORECASE)
+        if m:
+            ref = re.sub(r'\s+', '', m.group(1)).rstrip('.')
+            if 3 <= len(ref) <= 100:
+                result['reference_structure'] = ref
+                break
+
+    # ── 4. EXPÉDITEUR ────────────────────────────────────────────────────────
+    # a) Marqueur explicite
+    for pat in [
+        r'(?:De\s*:|Expéditeur\s*:|Emetteur\s*:|Expediteur\s*:)\s*(.+?)(?=\n|$)',
+        r'(?:De la part de|Par)\s*[:\-]?\s*(.+?)(?=\n|$)',
+    ]:
+        m = re.search(pat, full, re.IGNORECASE)
+        if m:
+            exp = re.sub(r'\s+', ' ', m.group(1)).strip()
+            if len(exp) > 2:
                 result['expediteur'] = exp[:200]
                 break
 
-    # --- Destinataire ---
+    # b) Heuristique : en-tête du document (premières lignes en majuscules = raison sociale)
+    if not result['expediteur']:
+        for line in lines[:6]:
+            if (
+                len(line) > 4
+                and not FIELD_LABEL.match(line)
+                and not re.match(r'^\d', line)
+                and (line.isupper() or (line[0].isupper() and not line.endswith(':')))
+            ):
+                result['expediteur'] = line[:200]
+                break
+
+    # ── 5. DESTINATAIRE ──────────────────────────────────────────────────────
     for pat in [
-        r'(?:À\s*:|A\s*:|Destinataire\s*:)\s*(.+?)(?=\n\s*(?:Réf|Date|Objet|NIF|De\s|$))',
         r"(?:À l['']attention de|A l['']attention de)\s*[:\-]?\s*(.+?)(?=\n|$)",
-        r'À\s*:\s*(.+?)(?=\n\s*(?:Réf|Date|Objet|$))',
+        r'(?:À\s*:|A\s*:|Destinataire\s*:)\s*(.+?)(?=\n|$)',
+        r'(?:Monsieur|Madame|M\.|Mme\.?)\s+(?:le\s+)?(?:Directeur|Président|Chef|Responsable|Ministre|DG|PDG|PCA)[^\n]{0,80}',
     ]:
-        dest_m = re.search(pat, text, re.IGNORECASE | re.DOTALL)
-        if dest_m:
-            dest = dest_m.group(1).strip()
-            # Nettoyer les espaces multiples et retours à la ligne
-            dest = re.sub(r'\s+', ' ', dest)
-            # Enlever les tirets en début
-            dest = dest.lstrip('—-–').strip()
-            if dest and len(dest) > 2:
+        m = re.search(pat, full, re.IGNORECASE)
+        if m:
+            grp = m.group(1) if m.lastindex and m.lastindex >= 1 else m.group(0)
+            dest = re.sub(r'\s+', ' ', grp).strip()
+            if len(dest) > 2:
                 result['destinataire'] = dest[:200]
                 break
 
-    # --- Type courrier (heuristique) ---
+    # ── 6. TYPE (heuristique mots-clés) ──────────────────────────────────────
     sortant_kws = [
         'nous vous informons', 'veuillez', 'je vous prie', 'nous vous prions',
-        'par la présente', 'je me permets', "nous avons l'honneur", 'suite à notre',
+        'par la présente', 'je me permets', "nous avons l'honneur",
+        'avons l\'honneur', 'suite à notre', 'permettons de',
     ]
-    if any(kw in text.lower() for kw in sortant_kws):
+    if any(kw in full.lower() for kw in sortant_kws):
         result['type_courrier'] = 'sortant'
 
-    # --- Notes (extrait du corps) ---
+    # ── 7. NOTES (corps du document) ─────────────────────────────────────────
     body_start = 0
     for i, line in enumerate(lines):
-        if any(kw in line.lower() for kw in ['objet :', 'monsieur,', 'madame,', 'bonjour,']):
+        if re.match(r'^(Monsieur|Madame|Bonjour|Cher|Objet)[,\s]', line, re.IGNORECASE):
             body_start = i + 1
             break
-    excerpt = ' '.join(lines[body_start:body_start + 3])
-    result['notes'] = excerpt[:300]
+    result['notes'] = re.sub(r'\s+', ' ', ' '.join(lines[body_start:body_start + 3])).strip()[:300]
 
     return result
+
+
+
+def _preprocess_for_ocr(pil_img):
+    """
+    Prétraitement d'une image PIL avant OCR Tesseract.
+    - Conversion en niveaux de gris
+    - Redimensionnement si trop petite (min 1500px de large)
+    - Binarisation adaptative (Otsu) pour maximiser le contraste texte/fond
+    """
+    import numpy as np
+    from PIL import Image
+
+    # Convertir en niveaux de gris
+    if pil_img.mode != 'L':
+        pil_img = pil_img.convert('L')
+
+    # Upscale si l'image est trop petite
+    w, h = pil_img.size
+    if w < 1500:
+        scale = 1500 / w
+        pil_img = pil_img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    # Binarisation Otsu via OpenCV
+    arr = np.array(pil_img)
+    _, binary = cv.threshold(arr, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+
+    # Légère débruitisation
+    binary = cv.fastNlMeansDenoising(binary, None, 10, 7, 21)
+
+    return Image.fromarray(binary)
 
 
 @api_view(['POST'])
@@ -368,10 +412,13 @@ def extract_document_info(request):
                     from PIL import Image
                     from pdf2image import convert_from_bytes
                     import io as _io
-                    images = convert_from_bytes(file_bytes, first_page=1, last_page=2, dpi=200)
+                    images = convert_from_bytes(file_bytes, first_page=1, last_page=3, dpi=300)
                     texts = []
                     for img in images:
-                        texts.append(pytesseract.image_to_string(img, lang='fra+eng'))
+                        img = _preprocess_for_ocr(img)
+                        texts.append(pytesseract.image_to_string(
+                            img, lang='fra', config='--oem 3 --psm 6'
+                        ))
                     extracted_text = '\n'.join(texts)
                     ocr_used = True
                 except ImportError:
@@ -383,9 +430,12 @@ def extract_document_info(request):
                 from PIL import Image
                 import io as _io
                 img = Image.open(_io.BytesIO(file_bytes))
-                if img.mode not in ('RGB', 'L'):
+                if img.mode not in ('RGB', 'L', 'RGBA'):
                     img = img.convert('RGB')
-                extracted_text = pytesseract.image_to_string(img, lang='fra+eng')
+                img = _preprocess_for_ocr(img)
+                extracted_text = pytesseract.image_to_string(
+                    img, lang='fra', config='--oem 3 --psm 6'
+                )
                 ocr_used = True
             except ImportError:
                 return Response({

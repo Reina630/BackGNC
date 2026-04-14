@@ -59,19 +59,12 @@ class User(AbstractUser):
         return check_password(raw_password, self.signature_password)
 
 
-class Log(models.Model):
-    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
-    action = models.CharField(max_length=255)
-    timestamp = models.DateTimeField(auto_now_add=True)
-
-    def __str__(self):
-        return f"{self.timestamp} - {self.user} - {self.action}"
-
-
 class Notification(models.Model):
     """Notifications pour les utilisateurs"""
     TYPE_CHOICES = [
         ('courrier_affecte', 'Courrier affecté'),
+        ('courrier_renvoye', 'Courrier renvoyé'),
+        ('courrier_urgent', 'Courrier urgent'),
         ('document_partage', 'Document partagé'),
         ('commentaire', 'Nouveau commentaire'),
         ('tache', 'Nouvelle tâche'),
@@ -83,6 +76,7 @@ class Notification(models.Model):
     titre = models.CharField(max_length=255)
     message = models.TextField()
     lue = models.BooleanField(default=False)
+    urgente = models.BooleanField(default=False, help_text="Alerte prioritaire à afficher en bannière")
     
     # Données supplémentaires pour créer des liens
     courrier_id = models.IntegerField(null=True, blank=True)

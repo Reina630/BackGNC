@@ -1,7 +1,5 @@
 from django.db import models
-from folders.models import Folder
 from users.models import User
-from tags.models import Tag
 
 
 class Categorie(models.Model):
@@ -19,120 +17,6 @@ class Categorie(models.Model):
     
     def __str__(self):
         return self.name
-
-
-class Document(models.Model):
-    FILE_TYPE_CHOICES = [
-        ('pdf', 'PDF'),
-        ('word', 'Word'),
-        ('excel', 'Excel'),
-        ('ppt', 'PowerPoint'),
-        ('image', 'Image'),
-        ('scan', 'Scan'),
-    ]
-
-    VISIBILITY_CHOICES = [
-        ('private', 'Privé'),
-        ('shared', 'Partagé'),
-        ('public', 'Public'),
-    ]
-
-    title = models.CharField(max_length=255)
-    file = models.FileField(upload_to='documents/%Y/%m/%d/')
-    file_size = models.BigIntegerField(default=0, help_text='Taille du fichier en octets')
-    owner = models.ForeignKey(User, on_delete=models.CASCADE)
-    folder = models.ForeignKey(Folder, on_delete=models.SET_NULL, null=True, blank=True)
-    tags = models.ManyToManyField(Tag, blank=True)
-    file_type = models.CharField(max_length=20, choices=FILE_TYPE_CHOICES)
-    visibility = models.CharField(max_length=20, choices=VISIBILITY_CHOICES, default='private')
-    is_favorite = models.BooleanField(default=False)
-    is_deleted = models.BooleanField(default=False, help_text='Document archivé/supprimé')
-    deleted_at = models.DateTimeField(null=True, blank=True, help_text='Date de suppression/archivage')
-    deleted_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='deleted_documents', help_text='Utilisateur qui a supprimé le document')
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    def __str__(self):
-        return self.title
-    
-    def soft_delete(self, user):
-        """Archiver (supprimer doucement) le document"""
-        from django.utils import timezone
-        self.is_deleted = True
-        self.deleted_at = timezone.now()
-        self.deleted_by = user
-        self.save()
-    
-    def restore(self):
-        """Restaurer le document depuis les archives"""
-        self.is_deleted = False
-        self.deleted_at = None
-        self.deleted_by = None
-        self.save()
-
-
-class DocumentVersion(models.Model):
-    document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name='versions')
-    file = models.FileField(upload_to='documents/versions/')
-    version_number = models.PositiveIntegerField()
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
-
-    def __str__(self):
-        return f"{self.document.title} v{self.version_number}"
-
-
-class DocumentShare(models.Model):
-    """Modèle pour gérer le partage de documents avec des utilisateurs spécifiques"""
-    
-    PERMISSION_CHOICES = [
-        ('view', 'Lecture seule'),
-        ('edit', 'Lecture et modification'),
-    ]
-    
-    document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name='shares')
-    shared_with = models.ForeignKey(User, on_delete=models.CASCADE, related_name='shared_documents')
-    shared_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='documents_shared')
-    permission = models.CharField(max_length=10, choices=PERMISSION_CHOICES, default='view')
-    shared_at = models.DateTimeField(auto_now_add=True)
-    
-    class Meta:
-        unique_together = ['document', 'shared_with']
-    
-    def __str__(self):
-        return f"{self.document.title} partagé avec {self.shared_with.username}"
-
-
-class ShareRequest(models.Model):
-    """Modèle pour gérer les demandes d'accès aux documents"""
-    
-    STATUS_CHOICES = [
-        ('pending', 'En attente'),
-        ('approved', 'Approuvée'),
-        ('rejected', 'Rejetée'),
-    ]
-    
-    PERMISSION_CHOICES = [
-        ('view', 'Lecture seule'),
-        ('edit', 'Lecture et modification'),
-    ]
-    
-    document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name='access_requests')
-    requested_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='document_requests')
-    requested_permission = models.CharField(max_length=10, choices=PERMISSION_CHOICES, default='view')
-    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
-    message = models.TextField(blank=True, help_text='Message de demande')
-    rejection_count = models.IntegerField(default=0, help_text='Nombre de fois que la demande a été rejetée')
-    created_at = models.DateTimeField(auto_now_add=True)
-    reviewed_at = models.DateTimeField(null=True, blank=True)
-    reviewed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='reviewed_requests')
-    
-    class Meta:
-        unique_together = ['document', 'requested_by']
-        ordering = ['-created_at']
-    
-    def __str__(self):
-        return f"{self.requested_by.username} demande accès à {self.document.title}"
 
 
 # ============================================================================
@@ -753,12 +637,6 @@ class ActionLog(models.Model):
         # Commentaires
         ('commentaire_add', 'Ajout de commentaire'),
         
-        # Documents
-        ('document_create', 'Création de document'),
-        ('document_update', 'Modification de document'),
-        ('document_delete', 'Suppression de document'),
-        ('document_share', 'Partage de document'),
-        
         # Utilisateurs
         ('user_login', 'Connexion'),
         ('user_logout', 'Déconnexion'),
@@ -782,9 +660,6 @@ class ActionLog(models.Model):
     courrier = models.ForeignKey('Courrier', on_delete=models.SET_NULL, null=True, blank=True, related_name='actions_log')
     courrier_numero = models.CharField(max_length=100, blank=True)  # Backup
     
-    document = models.ForeignKey('Document', on_delete=models.SET_NULL, null=True, blank=True, related_name='actions_log')
-    document_nom = models.CharField(max_length=255, blank=True)  # Backup
-    
     # Métadonnées
     timestamp = models.DateTimeField(auto_now_add=True, db_index=True)
     ip_address = models.GenericIPAddressField(null=True, blank=True)
@@ -807,7 +682,7 @@ class ActionLog(models.Model):
         return f"[{self.timestamp.strftime('%Y-%m-%d %H:%M')}] {self.utilisateur_username} - {self.get_action_type_display()}"
     
     @classmethod
-    def log_action(cls, action_type, utilisateur, description, courrier=None, document=None, request=None, **metadata):
+    def log_action(cls, action_type, utilisateur, description, courrier=None, request=None, **metadata):
         """
         Méthode utilitaire pour créer un log d'action facilement.
         
@@ -828,8 +703,6 @@ class ActionLog(models.Model):
             utilisateur_nom_complet=utilisateur.get_full_name() or utilisateur.username,
             courrier=courrier,
             courrier_numero=courrier.numero_registre if courrier else '',
-            document=document,
-            document_nom=document.nom if document else '',
             metadata=metadata
         )
         

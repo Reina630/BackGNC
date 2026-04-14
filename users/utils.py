@@ -4,7 +4,7 @@ Fonctions utilitaires pour la gestion des notifications
 from .models import Notification, User
 
 
-def creer_notification(utilisateur, type_notif, titre, message, courrier_id=None, document_id=None):
+def creer_notification(utilisateur, type_notif, titre, message, courrier_id=None, document_id=None, urgente=False):
     """
     Créer une nouvelle notification pour un utilisateur
     
@@ -29,6 +29,7 @@ def creer_notification(utilisateur, type_notif, titre, message, courrier_id=None
         message=message,
         courrier_id=courrier_id,
         document_id=document_id,
+        urgente=urgente,
     )
     
     return notification

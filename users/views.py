@@ -362,3 +362,35 @@ def supprimer_notification_view(request, pk):
     
     notification.delete()
     return Response({'message': 'Notification supprimée'}, status=status.HTTP_204_NO_CONTENT)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def alertes_view(request):
+    """
+    GET: Alertes urgentes non lues de l'utilisateur connecté.
+    Retourne uniquement les notifications marquées urgente=True et non lues.
+    """
+    alertes = Notification.objects.filter(
+        utilisateur=request.user,
+        urgente=True,
+        lue=False,
+    ).order_by('-created_at')
+    serializer = NotificationSerializer(alertes, many=True)
+    return Response(serializer.data)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def dismisser_alerte_view(request, pk):
+    """
+    POST: Marquer une alerte urgente comme lue (dismiss).
+    """
+    try:
+        notif = Notification.objects.get(pk=pk, utilisateur=request.user, urgente=True)
+    except Notification.DoesNotExist:
+        return Response({'error': 'Alerte non trouvée'}, status=status.HTTP_404_NOT_FOUND)
+    notif.lue = True
+    notif.lue_at = timezone.now()
+    notif.save(update_fields=['lue', 'lue_at'])
+    return Response({'ok': True})

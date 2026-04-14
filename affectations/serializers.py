@@ -186,62 +186,74 @@ class CircuitCreateSerializer(serializers.Serializer):
         return affectations
 
     def create(self, validated_data):
-        from users.models import Notification
-        
+        from users.models import Notification, User as UserModel
+
         affectations_data = validated_data.pop('affectations')
         request = self.context.get('request')
         user = request.user if request else None
 
         circuit = Circuit.objects.create(cree_par=user, **validated_data)
+        courrier = circuit.courrier
+        est_urgent = getattr(courrier, 'urgent', False)
 
         for aff_data in affectations_data:
             service = aff_data.get('service')
             destinataire = aff_data.pop('destinataire', None)
-            
+
             if destinataire:
-                # Affectation à un utilisateur spécifique
                 affectation = Affectation.objects.create(
                     circuit=circuit,
-                    courrier=circuit.courrier,
+                    courrier=courrier,
                     affecte_par=user,
                     destinataire=destinataire,
                     **aff_data,
                 )
-                
-                # Créer une notification pour le destinataire
+                # Alerte urgente pour le destinataire
                 Notification.objects.create(
                     utilisateur=destinataire,
                     type='courrier_affecte',
-                    titre=f'Nouveau courrier affecté : {circuit.courrier.numero_registre}',
-                    message=f'Le courrier "{circuit.courrier.objet}" vous a été affecté. Action requise : {affectation.get_action_requise_display()}',
-                    courrier_id=circuit.courrier.id,
+                    titre=f'Nouveau courrier à traiter : {courrier.numero_registre}',
+                    message=f'Le courrier « {courrier.objet} » vous a été affecté. Action requise : {affectation.get_action_requise_display()}.',
+                    courrier_id=courrier.id,
+                    urgente=True,
                 )
             else:
-                # Affectation à tous les utilisateurs du service
-                users_in_service = User.objects.filter(service=service, is_active=True)
-                
+                users_in_service = UserModel.objects.filter(service=service, is_active=True)
                 if not users_in_service.exists():
                     raise serializers.ValidationError(
                         f"Aucun utilisateur actif trouvé pour le service {service.nom}"
                     )
-                
                 for user_dest in users_in_service:
                     affectation = Affectation.objects.create(
                         circuit=circuit,
-                        courrier=circuit.courrier,
+                        courrier=courrier,
                         affecte_par=user,
                         destinataire=user_dest,
                         service=service,
                         **aff_data,
                     )
-                    
-                    # Créer une notification pour chaque destinataire
                     Notification.objects.create(
                         utilisateur=user_dest,
                         type='courrier_affecte',
-                        titre=f'Nouveau courrier affecté : {circuit.courrier.numero_registre}',
-                        message=f'Le courrier "{circuit.courrier.objet}" a été affecté à votre service ({service.nom}). Action requise : {affectation.get_action_requise_display()}',
-                        courrier_id=circuit.courrier.id,
+                        titre=f'Nouveau courrier à traiter : {courrier.numero_registre}',
+                        message=f'Le courrier « {courrier.objet} » a été affecté à votre service ({service.nom}). Action requise : {affectation.get_action_requise_display()}.',
+                        courrier_id=courrier.id,
+                        urgente=True,
                     )
+
+        # Si le courrier est urgent, alerter aussi les RH + DG (sauf l'affecteur lui-même)
+        if est_urgent:
+            rh_dg_users = UserModel.objects.filter(role__in=['rh', 'dg', 'admin'], is_active=True)
+            if user:
+                rh_dg_users = rh_dg_users.exclude(pk=user.pk)
+            for u in rh_dg_users:
+                Notification.objects.create(
+                    utilisateur=u,
+                    type='courrier_urgent',
+                    titre=f'Courrier urgent affecté : {courrier.numero_registre}',
+                    message=f'Le courrier urgent « {courrier.objet} » vient d\'être affecté.',
+                    courrier_id=courrier.id,
+                    urgente=True,
+                )
 
         return circuit
