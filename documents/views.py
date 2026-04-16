@@ -444,24 +444,26 @@ class CourrierViewSet(viewsets.ModelViewSet):
             }
         stats['par_statut'] = par_statut
         
-        # Répartition par service avec charge de travail
+        # Répartition par service basée sur les services réels de la base de données
+        from users.models import Service as ServiceModel
+        from affectations.models import Affectation as AffectationModel
         par_service = {}
-        total_courriers_services = queryset.exclude(service_concerne='').count()
-        for service_key, service_label in Courrier.SERVICE_CHOICES:
-            if service_key:  # Ignorer les valeurs vides
-                count = queryset.filter(service_concerne=service_key).count()
-                en_traitement = queryset.filter(
-                    service_concerne=service_key,
-                    statut__in=['recu', 'affecte', 'en_traitement']
-                ).count()
-                if count > 0:
-                    pourcentage = round((count / total_courriers_services * 100), 1) if total_courriers_services > 0 else 0
-                    par_service[service_key] = {
-                        'label': service_label,
-                        'count': count,
-                        'en_traitement': en_traitement,
-                        'pourcentage': pourcentage
-                    }
+        services_db = ServiceModel.objects.all()
+        total_affectations_services = AffectationModel.objects.filter(service__isnull=False).count()
+        for service_obj in services_db:
+            count = AffectationModel.objects.filter(service=service_obj).count()
+            en_traitement = AffectationModel.objects.filter(
+                service=service_obj,
+                statut__in=['recu', 'affecte', 'en_traitement']
+            ).count()
+            if count > 0:
+                pourcentage = round((count / total_affectations_services * 100), 1) if total_affectations_services > 0 else 0
+                par_service[service_obj.nom] = {
+                    'label': service_obj.nom,
+                    'count': count,
+                    'en_traitement': en_traitement,
+                    'pourcentage': pourcentage
+                }
         stats['par_service'] = par_service
         
         # Distribution par type (pour le graphique en camembert)
@@ -812,43 +814,21 @@ class CourrierViewSet(viewsets.ModelViewSet):
                 'iconColor': icon_color_map.get(courrier.type_courrier, 'bg-slate-50 text-slate-600')
             })
         
-        # 6. Service Workload - format design
-        # Combiner la charge de travail des courriers (service_concerne) et des affectations v2 (service)
+        # 6. Service Workload - basé uniquement sur les services réels de la base de données
         from collections import defaultdict
-        
-        # Charge basée sur service_concerne du courrier
-        charge_par_service = defaultdict(lambda: {'count': 0, 'label': '', 'en_traitement': 0})
-        
-        for service_key, service_label in Courrier.SERVICE_CHOICES:
-            if service_key:  # Ignorer les valeurs vides
-                count = queryset.filter(service_concerne=service_key).count()
-                en_traitement = queryset.filter(
-                    service_concerne=service_key,
-                    statut__in=['recu', 'affecte', 'en_traitement']
-                ).count()
-                if count > 0:
-                    charge_par_service[service_key] = {
-                        'count': count,
-                        'label': service_label,
-                        'en_traitement': en_traitement
-                    }
-        
-        # Ajouter la charge basée sur les affectations v2 en cours
         from users.models import Service
+
+        charge_par_service = defaultdict(lambda: {'count': 0, 'label': '', 'en_traitement': 0})
+
+        # Compter les affectations actives par service (Service model = source de vérité)
         affectations_actives_v2 = Affectation.objects.exclude(
             statut__in=['valide', 'signe', 'rejete', 'renvoye']
         ).select_related('service')
-        
+
         for affectation in affectations_actives_v2:
             if affectation.service:
                 service_nom = affectation.service.nom
-                # Ajouter à la charge du service
-                if service_nom not in charge_par_service:
-                    charge_par_service[service_nom] = {
-                        'count': 0,
-                        'label': service_nom,
-                        'en_traitement': 0
-                    }
+                charge_par_service[service_nom]['label'] = service_nom
                 charge_par_service[service_nom]['count'] += 1
                 charge_par_service[service_nom]['en_traitement'] += 1
         

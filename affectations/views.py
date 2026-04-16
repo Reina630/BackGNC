@@ -1,6 +1,7 @@
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.utils import timezone
 from django.db import transaction
 
@@ -107,6 +108,152 @@ class CircuitViewSet(viewsets.ModelViewSet):
             ).data,
         }
         return Response(data)
+
+    @action(detail=True, methods=['post'])
+    def ajouter_affectations(self, request, pk=None):
+        """
+        Ajouter des affectations à un circuit existant.
+        POST /api/affectations/circuits/{id}/ajouter_affectations/
+
+        Body :
+        {
+            "affectations": [
+                {
+                    "service": <service_id>,
+                    "destinataire": <user_id>,   (optionnel)
+                    "action_requise": "informatif",
+                    "niveau_urgence": "normal",
+                    "etape_numero": 2,
+                    "note_instruction": "...",
+                    "date_echeance": "2026-05-01"
+                }
+            ]
+        }
+        """
+        circuit = self.get_object()
+
+        if circuit.statut in ('termine', 'annule'):
+            return Response(
+                {'detail': 'Impossible d\'ajouter des affectations à un circuit terminé ou annulé.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        affectations_data = request.data.get('affectations', [])
+        if not affectations_data:
+            return Response(
+                {'detail': 'La liste des affectations ne peut pas être vide.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        from users.models import Notification, User as UserModel, Service
+
+        courrier = circuit.courrier
+        user = request.user
+        created = []
+
+        with transaction.atomic():
+            for aff_data in affectations_data:
+                service_id = aff_data.get('service')
+                destinataire_id = aff_data.get('destinataire')
+
+                if not service_id:
+                    return Response(
+                        {'detail': 'Chaque affectation doit avoir un service.'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                try:
+                    service = Service.objects.get(id=service_id)
+                except Service.DoesNotExist:
+                    return Response(
+                        {'detail': f'Service {service_id} introuvable.'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                create_kwargs = {
+                    'action_requise': aff_data.get('action_requise', 'informatif'),
+                    'niveau_urgence': aff_data.get('niveau_urgence', 'normal'),
+                    'etape_numero': aff_data.get('etape_numero', 1),
+                    'note_instruction': aff_data.get('note_instruction', ''),
+                    'date_echeance': aff_data.get('date_echeance') or None,
+                }
+
+                if destinataire_id:
+                    try:
+                        destinataire = UserModel.objects.get(id=destinataire_id)
+                    except UserModel.DoesNotExist:
+                        return Response(
+                            {'detail': f'Utilisateur {destinataire_id} introuvable.'},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                    aff = Affectation.objects.create(
+                        circuit=circuit,
+                        courrier=courrier,
+                        affecte_par=user,
+                        destinataire=destinataire,
+                        service=service,
+                        **create_kwargs,
+                    )
+                    created.append(aff)
+                    Notification.objects.create(
+                        utilisateur=destinataire,
+                        type='courrier_affecte',
+                        titre=f'Nouveau courrier à traiter : {courrier.numero_registre}',
+                        message=(
+                            f'Le courrier « {courrier.objet} » vous a été affecté. '
+                            f'Action requise : {aff.get_action_requise_display()}.'
+                        ),
+                        courrier_id=courrier.id,
+                        urgente=True,
+                    )
+                else:
+                    users_in_service = UserModel.objects.filter(service=service, is_active=True)
+                    if not users_in_service.exists():
+                        return Response(
+                            {'detail': f'Aucun utilisateur actif trouvé pour le service {service.nom}.'},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                    for user_dest in users_in_service:
+                        aff = Affectation.objects.create(
+                            circuit=circuit,
+                            courrier=courrier,
+                            affecte_par=user,
+                            destinataire=user_dest,
+                            service=service,
+                            **create_kwargs,
+                        )
+                        created.append(aff)
+                        Notification.objects.create(
+                            utilisateur=user_dest,
+                            type='courrier_affecte',
+                            titre=f'Nouveau courrier à traiter : {courrier.numero_registre}',
+                            message=(
+                                f'Le courrier « {courrier.objet} » a été affecté à votre service '
+                                f'({service.nom}). Action requise : {aff.get_action_requise_display()}.'
+                            ),
+                            courrier_id=courrier.id,
+                            urgente=True,
+                        )
+
+            # Log d'audit
+            try:
+                ActionLog.log_action(
+                    action_type='affectation_courrier',
+                    utilisateur=user,
+                    description=(
+                        f"{user.get_full_name() or user.username} a ajouté {len(created)} affectation(s) "
+                        f"au circuit du courrier {courrier.numero_registre}"
+                    ),
+                    courrier=courrier,
+                    request=request,
+                )
+            except Exception as e:
+                print(f"[ajouter_affectations] ActionLog error: {e}")
+
+        return Response(
+            CircuitSerializer(circuit, context={'request': request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 # ============================================================================
@@ -375,3 +522,153 @@ class AffectationViewSet(viewsets.ModelViewSet):
         return Response(
             AffectationSerializer(affectation, context={'request': request}).data
         )
+
+    @action(detail=True, methods=['post'], parser_classes=[MultiPartParser, FormParser, JSONParser])
+    def soumettre_reponse(self, request, pk=None):
+        """
+        Soumettre une réponse à un courrier depuis une affectation 'a_repondre'.
+        Crée un courrier sortant et, si soumettre=true, valide l'affectation et
+        notifie RH/DG/admin.
+
+        POST /api/affectations/affectations/{id}/soumettre_reponse/
+        Body (multipart) :
+          - objet            : str (requis)
+          - destinataire     : str (requis)
+          - date_envoi       : date YYYY-MM-DD (requis si soumettre=true)
+          - mode_envoi       : str (optionnel, défaut 'courrier')
+          - contenu_lettre   : str (optionnel)
+          - categorie        : int pk (optionnel)
+          - fichier          : File (requis)
+          - soumettre        : '1' | 'true' pour valider, sinon brouillon
+        """
+        affectation = self.get_object()
+        user = request.user
+
+        # Vérifier que c'est bien l'affectation de cet utilisateur
+        if affectation.destinataire != user:
+            return Response(
+                {'detail': "Vous n'êtes pas le destinataire de cette affectation."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if affectation.action_requise != 'a_repondre':
+            return Response(
+                {'detail': "Cette affectation ne nécessite pas de réponse."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        data = request.data
+        fichier = request.FILES.get('fichier')
+        objet = data.get('objet', '').strip()
+        destinataire = data.get('destinataire', '').strip()
+        date_envoi = data.get('date_envoi', '').strip()
+        mode_envoi = data.get('mode_envoi', 'courrier')
+        contenu_lettre = data.get('contenu_lettre', '')
+        categorie_id = data.get('categorie')
+        soumettre = str(data.get('soumettre', '')).lower() in ('1', 'true', 'yes')
+
+        if not objet:
+            return Response({'detail': "L'objet est obligatoire."}, status=status.HTTP_400_BAD_REQUEST)
+        if not destinataire:
+            return Response({'detail': "Le destinataire est obligatoire."}, status=status.HTTP_400_BAD_REQUEST)
+        if not fichier:
+            return Response({'detail': "Le fichier est obligatoire."}, status=status.HTTP_400_BAD_REQUEST)
+        if soumettre and not date_envoi:
+            return Response({'detail': "La date d'envoi est obligatoire pour soumettre."}, status=status.HTTP_400_BAD_REQUEST)
+
+        courrier_original = affectation.courrier
+
+        try:
+            with transaction.atomic():
+                from documents.models import Courrier as CourrierModel, ActionLog as ActionLogModel
+                from documents.serializer import CourrierSerializer
+
+                create_kwargs = dict(
+                    type_courrier='sortant',
+                    objet=objet,
+                    destinataire=destinataire,
+                    mode_envoi=mode_envoi,
+                    statut='en_traitement' if soumettre else 'brouillon',
+                    fichier=fichier,
+                    reponse_a=courrier_original,
+                    enregistre_par=user,
+                )
+                if date_envoi:
+                    from datetime import date as DateType
+                    try:
+                        create_kwargs['date_envoi'] = DateType.fromisoformat(date_envoi)
+                    except (ValueError, TypeError):
+                        create_kwargs['date_envoi'] = date_envoi
+                if contenu_lettre:
+                    create_kwargs['contenu_lettre'] = contenu_lettre
+                if categorie_id:
+                    create_kwargs['categorie_id'] = categorie_id
+
+                courrier_reponse = CourrierModel.objects.create(**create_kwargs)
+                if courrier_reponse.fichier:
+                    courrier_reponse.file_size = courrier_reponse.fichier.size
+                    courrier_reponse.save(update_fields=['file_size'])
+
+                auteur = user.get_full_name() or user.username
+
+                try:
+                    ActionLogModel.log_action(
+                        action_type='courrier_create',
+                        utilisateur=user,
+                        description=f"Courrier {courrier_reponse.numero_registre} créé en réponse à {courrier_original.numero_registre}",
+                        courrier=courrier_reponse,
+                        request=request,
+                    )
+                except Exception as e:
+                    print(f"[soumettre_reponse] ActionLog create error: {e}")
+
+                if soumettre:
+                    if affectation.statut not in ('valide', 'rejete', 'renvoye', 'signe'):
+                        affectation.valider(f"Réponse soumise : {courrier_reponse.numero_registre}")
+
+                    try:
+                        ActionLogModel.log_action(
+                            action_type='affectation_repondre',
+                            utilisateur=user,
+                            description=(
+                                f"{auteur} a soumis une réponse au courrier "
+                                f"{courrier_original.numero_registre} — "
+                                f"courrier sortant : {courrier_reponse.numero_registre}"
+                            ),
+                            courrier=courrier_original,
+                            request=request,
+                        )
+                    except Exception as e:
+                        print(f"[soumettre_reponse] ActionLog repondre error: {e}")
+
+                    try:
+                        from users.models import Notification, User as UserModel
+                        rh_dg = UserModel.objects.filter(role__in=['rh', 'dg', 'admin'], is_active=True)
+                        for u in rh_dg:
+                            Notification.objects.create(
+                                utilisateur=u,
+                                type='courrier_repondu',
+                                titre=f'Réponse soumise — à valider : {courrier_original.numero_registre}',
+                                message=(
+                                    f'{auteur} a soumis une réponse au courrier '
+                                    f'« {courrier_original.objet} » '
+                                    f'(réf. {courrier_original.numero_registre}). '
+                                    f'Courrier sortant {courrier_reponse.numero_registre} en attente de validation.'
+                                ),
+                                courrier_id=courrier_original.id,
+                                urgente=True,
+                            )
+                    except Exception as e:
+                        print(f"[soumettre_reponse] Notification error: {e}")
+
+            return Response(
+                CourrierSerializer(courrier_reponse).data,
+                status=status.HTTP_201_CREATED,
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return Response(
+                {'detail': f"Erreur lors de la création : {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )

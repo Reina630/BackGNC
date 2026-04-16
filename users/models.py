@@ -64,6 +64,7 @@ class Notification(models.Model):
     TYPE_CHOICES = [
         ('courrier_affecte', 'Courrier affecté'),
         ('courrier_renvoye', 'Courrier renvoyé'),
+        ('courrier_repondu', 'Réponse soumise'),
         ('courrier_urgent', 'Courrier urgent'),
         ('document_partage', 'Document partagé'),
         ('commentaire', 'Nouveau commentaire'),

@@ -49,7 +49,7 @@ class Courrier(models.Model):
     SERVICE_CHOICES = [
         ('rh', 'Ressources Humaines'),
         ('comptabilite', 'Comptabilité'),
-        ('direction', 'Direction'),
+        ('direction', 'Direction Générale'),
         ('technique', 'Service Technique'),
         ('commercial', 'Commercial'),
         ('juridique', 'Juridique'),
